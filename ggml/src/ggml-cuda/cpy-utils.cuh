@@ -186,6 +186,209 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// TurboQuant tq3_0 constants for GPU
+// Lloyd-Max optimal 8-level centroids for N(0,1)
+__device__ static const float TQ3_0_BOUNDARIES_D[7] = {
+    -1.7479f, -1.0500f, -0.5005f, 0.0f, 0.5005f, 1.0500f, 1.7479f
+};
+
+// Deterministic sign flip pattern: sign[i] = ((i * 0x9E3779B9) >> 31) ? -1.0 : +1.0
+__device__ static const float TQ3_0_SIGNS_D[128] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f,
+    +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f,
+    +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f,
+    +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f,
+    +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f,
+};
+
+static __device__ void quantize_f32_tq3_0_block(const float * __restrict__ x, block_tq3_0 * __restrict__ y) {
+    float buf[QK_TQ3_0];
+
+    // 1. Compute RMS scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        sum_sq += x[j] * x[j];
+    }
+    float rms = sqrtf(sum_sq / QK_TQ3_0);
+    if (rms < 1e-10f) { rms = 1.0f; }
+
+    y->d = rms;
+    const float inv_rms = 1.0f / rms;
+
+    // 2. Normalize and apply sign flips
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        buf[j] = x[j] * inv_rms * TQ3_0_SIGNS_D[j];
+    }
+
+    // 3. In-place Walsh-Hadamard Transform (log2(QK_TQ3_0) butterfly stages)
+    for (int step = 1; step < QK_TQ3_0; step <<= 1) {
+        for (int i = 0; i < QK_TQ3_0; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j];
+                float b = buf[j + step];
+                buf[j]        = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+
+    // Normalize by 1/sqrt(QK_TQ3_0)
+    const float norm = 1.0f / sqrtf((float)QK_TQ3_0);
+
+    // 4. Quantize to 3-bit Lloyd-Max indices and pack
+    uint8_t indices[QK_TQ3_0];
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        float v = buf[j] * norm;
+        uint8_t idx = 0;
+        for (int b = 0; b < 7; b++) {
+            if (v > TQ3_0_BOUNDARIES_D[b]) { idx = b + 1; }
+        }
+        indices[j] = idx;
+    }
+
+    // 5. Pack 3-bit indices: groups of 8 indices -> 3 bytes
+    for (int g = 0; g < QK_TQ3_0 / 8; g++) {
+        const uint8_t * idx = indices + g * 8;
+        uint8_t * qp = y->qs + g * 3;
+        qp[0] = (idx[0])      | (idx[1] << 3) | (idx[2] << 6);
+        qp[1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);
+        qp[2] = (idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5);
+    }
+}
+
+// TurboQuant tq4_0 4-bit Lloyd-Max 16-level boundaries
+__device__ static const float TQ4_0_BOUNDARIES_D[15] = {
+    -2.4013f, -1.8441f, -1.4377f, -1.0998f, -0.8000f, -0.5227f, -0.2584f, 0.0f,
+     0.2584f,  0.5227f,  0.8000f,  1.0998f,  1.4377f,  1.8441f,  2.4013f
+};
+
+static __device__ void quantize_f32_tq4_0_block(const float * __restrict__ x, block_tq4_0 * __restrict__ y) {
+    float buf[QK_TQ4_0];
+
+    // 1. Compute RMS scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_TQ4_0; j++) {
+        sum_sq += x[j] * x[j];
+    }
+    float rms = sqrtf(sum_sq / QK_TQ4_0);
+    if (rms < 1e-10f) { rms = 1.0f; }
+
+    y->d = rms;
+    const float inv_rms = 1.0f / rms;
+
+    // 2. Normalize and apply sign flips (same signs as TQ3_0)
+    for (int j = 0; j < QK_TQ4_0; j++) {
+        buf[j] = x[j] * inv_rms * TQ3_0_SIGNS_D[j];
+    }
+
+    // 3. In-place Walsh-Hadamard Transform
+    for (int step = 1; step < QK_TQ4_0; step <<= 1) {
+        for (int i = 0; i < QK_TQ4_0; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j];
+                float b = buf[j + step];
+                buf[j]        = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+
+    const float norm = 1.0f / sqrtf((float)QK_TQ4_0);
+
+    // 4. Quantize to 4-bit and pack (two indices per byte)
+    for (int j = 0; j < QK_TQ4_0 / 2; j++) {
+        float v0 = buf[2 * j] * norm;
+        float v1 = buf[2 * j + 1] * norm;
+
+        uint8_t idx0 = 0;
+        for (int b = 0; b < 15; b++) {
+            if (v0 > TQ4_0_BOUNDARIES_D[b]) { idx0 = b + 1; }
+        }
+        uint8_t idx1 = 0;
+        for (int b = 0; b < 15; b++) {
+            if (v1 > TQ4_0_BOUNDARIES_D[b]) { idx1 = b + 1; }
+        }
+
+        y->qs[j] = idx0 | (idx1 << 4);
+    }
+}
+
+// TurboQuant tq2_0 2-bit Lloyd-Max 4-level boundaries
+__device__ static const float TQ2_0_BOUNDARIES_D[3] = {
+    -0.9816f, 0.0f, 0.9816f
+};
+
+static __device__ void quantize_f32_tq2_0_block(const float * __restrict__ x, block_tq2_0 * __restrict__ y) {
+    float buf[QK_TQ2_0];
+
+    // 1. Compute RMS scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_TQ2_0; j++) {
+        sum_sq += x[j] * x[j];
+    }
+    float rms = sqrtf(sum_sq / QK_TQ2_0);
+    if (rms < 1e-10f) { rms = 1.0f; }
+
+    y->d = rms;
+    const float inv_rms = 1.0f / rms;
+
+    // 2. Normalize and apply sign flips (same signs as TQ3_0)
+    for (int j = 0; j < QK_TQ2_0; j++) {
+        buf[j] = x[j] * inv_rms * TQ3_0_SIGNS_D[j];
+    }
+
+    // 3. In-place Walsh-Hadamard Transform
+    for (int step = 1; step < QK_TQ2_0; step <<= 1) {
+        for (int i = 0; i < QK_TQ2_0; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j];
+                float b = buf[j + step];
+                buf[j]        = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+
+    const float norm = 1.0f / sqrtf((float)QK_TQ2_0);
+
+    // 4. Quantize to 2-bit and pack (four indices per byte)
+    for (int j = 0; j < QK_TQ2_0 / 4; j++) {
+        uint8_t packed = 0;
+        for (int k = 0; k < 4; k++) {
+            float v = buf[4 * j + k] * norm;
+            uint8_t idx = 0;
+            for (int b = 0; b < 3; b++) {
+                if (v > TQ2_0_BOUNDARIES_D[b]) { idx = b + 1; }
+            }
+            packed |= (idx << (2 * k));
+        }
+        y->qs[j] = packed;
+    }
+}
+
+static __device__ void cpy_blck_f32_tq3_0(const char * cxi, char * cdsti) {
+    quantize_f32_tq3_0_block((const float *)cxi, (block_tq3_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_tq4_0(const char * cxi, char * cdsti) {
+    quantize_f32_tq4_0_block((const float *)cxi, (block_tq4_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_tq2_0(const char * cxi, char * cdsti) {
+    quantize_f32_tq2_0_block((const float *)cxi, (block_tq2_0 *)cdsti);
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

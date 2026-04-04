@@ -318,11 +318,22 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ2_0, GGML_TYPE_TQ2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ4_0, GGML_TYPE_TQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ4_0, GGML_TYPE_TQ2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ2_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ2_0, GGML_TYPE_TQ2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ4_0, GGML_TYPE_TQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ4_0, GGML_TYPE_TQ2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ2_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -440,6 +451,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
+        case GGML_TYPE_TQ4_0:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -518,6 +532,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // TQ2_0/TQ3_0/TQ4_0 are only supported by the vec kernel, not by tile/mma/wmma:
+    if (can_use_vector_kernel && (K->type == GGML_TYPE_TQ2_0 || V->type == GGML_TYPE_TQ2_0 ||
+                                  K->type == GGML_TYPE_TQ3_0 || V->type == GGML_TYPE_TQ3_0 ||
+                                  K->type == GGML_TYPE_TQ4_0 || V->type == GGML_TYPE_TQ4_0)) {
+        return BEST_FATTN_KERNEL_VEC;
     }
 
     // If there are no tensor cores available, use the generic tile kernel:

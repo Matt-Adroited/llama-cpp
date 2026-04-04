@@ -107,9 +107,21 @@ void quantize_row_tq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
 }
 
 void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
-    assert(k % QK_K == 0);
+    assert(k % QK_TQ2_0 == 0);
     block_tq2_0 * GGML_RESTRICT y = vy;
     quantize_row_tq2_0_ref(x, y, k);
+}
+
+void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    block_tq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tq3_0_ref(x, y, k);
+}
+
+void quantize_row_tq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ4_0 == 0);
+    block_tq4_0 * GGML_RESTRICT y = vy;
+    quantize_row_tq4_0_ref(x, y, k);
 }
 
 //===================================== Q8_K ==============================================
@@ -506,6 +518,79 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
 
         sumf += (float) sumi * d;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq3_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+    // Number of q8_0 blocks (QK8_0=32) per tq3_0 block (QK_TQ3_0=128)
+    const int q8_per_tq3 = QK_TQ3_0 / QK8_0;
+
+    float sumf = 0.0f;
+    float tmp[QK_TQ3_0];
+
+    for (int i = 0; i < nb; ++i) {
+        // Dequantize TQ3_0 block to float (includes inverse WHT)
+        dequantize_row_tq3_0(&x[i], tmp, QK_TQ3_0);
+
+        // Dot product with multiple Q8_0 blocks spanning this TQ3_0 block
+        for (int q = 0; q < q8_per_tq3; q++) {
+            const block_q8_0 * yb = &y[i * q8_per_tq3 + q];
+            const float d_q8 = GGML_CPU_FP16_TO_FP32(yb->d);
+            float dot = 0.0f;
+            for (int j = 0; j < QK8_0; j++) {
+                dot += tmp[q * QK8_0 + j] * (float)yb->qs[j];
+            }
+            sumf += dot * d_q8;
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ4_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq4_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ4_0;
+    const int q8_per_tq4 = QK_TQ4_0 / QK8_0;
+
+    float sumf = 0.0f;
+    float tmp[QK_TQ4_0];
+
+    for (int i = 0; i < nb; ++i) {
+        // Dequantize TQ4_0 block to float (includes inverse WHT)
+        dequantize_row_tq4_0(&x[i], tmp, QK_TQ4_0);
+
+        // Dot product with multiple Q8_0 blocks spanning this TQ4_0 block
+        for (int q = 0; q < q8_per_tq4; q++) {
+            const block_q8_0 * yb = &y[i * q8_per_tq4 + q];
+            const float d_q8 = GGML_CPU_FP16_TO_FP32(yb->d);
+            float dot = 0.0f;
+            for (int j = 0; j < QK8_0; j++) {
+                dot += tmp[q * QK8_0 + j] * (float)yb->qs[j];
+            }
+            sumf += dot * d_q8;
+        }
     }
 
     *s = sumf;

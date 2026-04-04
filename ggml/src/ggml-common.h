@@ -270,12 +270,35 @@ typedef struct {
 } block_tq1_0;
 static_assert(sizeof(block_tq1_0) == sizeof(ggml_half) + QK_K / 64 + (QK_K - 4 * QK_K / 64) / 5, "wrong tq1_0 block size/padding");
 
-// 2.0625 bpw
+// TurboQuant 2-bit (2.125 bpw)
+// 128 values per block, WHT rotation + Lloyd-Max 4-level codebook
+// Designed for V cache in asymmetric K4/V2 configuration
+#define QK_TQ2_0 128
 typedef struct {
-    uint8_t qs[QK_K/4]; // 2 bits per element
-    ggml_half d;
+    ggml_half d;                    // scale factor (RMS of block)
+    uint8_t qs[QK_TQ2_0 / 4];      // 2-bit quant indices, packed (32 bytes)
 } block_tq2_0;
-static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_TQ2_0 / 4, "wrong tq2_0 block size/padding");
+
+// TurboQuant 3-bit (3.5 bpw)
+// 128 values per block, WHT rotation + Lloyd-Max 8-level codebook
+// Block size matches common head_dim=128 for KV cache flash attention compatibility
+#define QK_TQ3_0 128
+typedef struct {
+    ggml_half d;                    // scale factor (RMS of block)
+    uint8_t qs[QK_TQ3_0 * 3 / 8];  // 3-bit quant indices, packed (48 bytes)
+} block_tq3_0;
+static_assert(sizeof(block_tq3_0) == sizeof(ggml_half) + QK_TQ3_0 * 3 / 8, "wrong tq3_0 block size/padding");
+
+// TurboQuant 4-bit (4.125 bpw)
+// 128 values per block, WHT rotation + Lloyd-Max 16-level codebook
+// 4-bit is the sweet spot for KV cache keys (0.995 cosine sim, 20.3 dB SNR)
+#define QK_TQ4_0 128
+typedef struct {
+    ggml_half d;                    // scale factor (RMS of block)
+    uint8_t qs[QK_TQ4_0 / 2];      // 4-bit quant indices, packed (64 bytes)
+} block_tq4_0;
+static_assert(sizeof(block_tq4_0) == sizeof(ggml_half) + QK_TQ4_0 / 2, "wrong tq4_0 block size/padding");
 
 //
 // Super-block quantization structures

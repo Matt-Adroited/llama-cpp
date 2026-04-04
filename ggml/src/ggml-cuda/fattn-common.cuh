@@ -617,6 +617,380 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// TurboQuant tq3_0 dequantize constants for flash attention
+__device__ static const float TQ3_0_CENTROIDS_FA[8] = {
+    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1519f
+};
+
+__device__ static const float TQ3_0_SIGNS_FA[128] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f,
+    +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f,
+    +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f,
+    +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f,
+    +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f,
+};
+
+// Dequantize a full tq3_0 block into float[QK_TQ3_0]
+static __device__ __forceinline__ void dequantize_tq3_0_block(const block_tq3_0 * __restrict__ blk, float * __restrict__ out) {
+    const float d = blk->d;
+
+    uint8_t indices[QK_TQ3_0];
+    for (int g = 0; g < QK_TQ3_0 / 8; g++) {
+        const uint8_t * qp = blk->qs + g * 3;
+        uint8_t * idx = indices + g * 8;
+        idx[0] =  qp[0]       & 7;
+        idx[1] = (qp[0] >> 3) & 7;
+        idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
+        idx[3] = (qp[1] >> 1) & 7;
+        idx[4] = (qp[1] >> 4) & 7;
+        idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
+        idx[6] = (qp[2] >> 2) & 7;
+        idx[7] = (qp[2] >> 5) & 7;
+    }
+
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        out[j] = TQ3_0_CENTROIDS_FA[indices[j]];
+    }
+
+    for (int step = 1; step < QK_TQ3_0; step <<= 1) {
+        for (int i = 0; i < QK_TQ3_0; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j]        = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+
+    const float norm_d = d / sqrtf((float)QK_TQ3_0);
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        out[j] *= norm_d * TQ3_0_SIGNS_FA[j];
+    }
+}
+
+// Flash attention K dot product for tq3_0 (optimized: Q pre-rotated with WHT)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tq3_0 * K_tq3 = (const block_tq3_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+    constexpr int n_blocks = D / QK_TQ3_0;
+    constexpr int qi_per_block = QK_TQ3_0 / (int)sizeof(int);
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        float cent[QK_TQ3_0];
+        {
+            const block_tq3_0 * b = &K_tq3[blk];
+            for (int g = 0; g < QK_TQ3_0 / 8; g++) {
+                const uint8_t * qp = b->qs + g * 3;
+                cent[g*8 + 0] = TQ3_0_CENTROIDS_FA[ qp[0]       & 7];
+                cent[g*8 + 1] = TQ3_0_CENTROIDS_FA[(qp[0] >> 3) & 7];
+                cent[g*8 + 2] = TQ3_0_CENTROIDS_FA[((qp[0] >> 6) | (qp[1] << 2)) & 7];
+                cent[g*8 + 3] = TQ3_0_CENTROIDS_FA[(qp[1] >> 1) & 7];
+                cent[g*8 + 4] = TQ3_0_CENTROIDS_FA[(qp[1] >> 4) & 7];
+                cent[g*8 + 5] = TQ3_0_CENTROIDS_FA[((qp[1] >> 7) | (qp[2] << 1)) & 7];
+                cent[g*8 + 6] = TQ3_0_CENTROIDS_FA[(qp[2] >> 2) & 7];
+                cent[g*8 + 7] = TQ3_0_CENTROIDS_FA[(qp[2] >> 5) & 7];
+            }
+        }
+
+        const float k_scale = (float)K_tq3[blk].d * rsqrtf((float)QK_TQ3_0);
+
+#pragma unroll
+        for (int k_local_0 = 0; k_local_0 < qi_per_block; k_local_0 += nthreads) {
+            const int k_local = k_local_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            const int elem_start = k_local * 4;
+            const int q_reg_idx = (blk * qi_per_block + k_local_0) / nthreads;
+
+            const int u = Q_q8[q_reg_idx];
+            const int8_t * q8 = (const int8_t *)&u;
+            const float2 Q_ds = ((const float2 *) Q_ds_v)[q_reg_idx];
+
+            float block_sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                block_sum += cent[elem_start + j] * (float)q8[j];
+            }
+
+            sum += block_sum * Q_ds.x * k_scale;
+        }
+    }
+
+    return sum;
+}
+
+// Flash attention V dequantize for tq3_0 (rotated space)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq3_0 * x = (const block_tq3_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TQ3_0;
+    const int     iqs = i0 % QK_TQ3_0;
+
+    const float d = (float)x[ib].d;
+    const float k_scale = d * rsqrtf((float)QK_TQ3_0);
+
+    float cent[ne];
+    for (int l = 0; l < ne; l++) {
+        const int j = iqs + l;
+        const int g = j / 8;
+        const int r = j % 8;
+        const uint8_t * qp = x[ib].qs + g * 3;
+        uint8_t idx;
+        switch (r) {
+            case 0: idx =  qp[0]       & 7; break;
+            case 1: idx = (qp[0] >> 3) & 7; break;
+            case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
+            case 3: idx = (qp[1] >> 1) & 7; break;
+            case 4: idx = (qp[1] >> 4) & 7; break;
+            case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
+            case 6: idx = (qp[2] >> 2) & 7; break;
+            default: idx = (qp[2] >> 5) & 7; break;
+        }
+        cent[l] = TQ3_0_CENTROIDS_FA[idx] * k_scale;
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(cent[l0], cent[l0 + 1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = cent[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+// TurboQuant tq2_0 constants for flash attention (4-level Lloyd-Max)
+__device__ static const float TQ2_0_CENTROIDS_FA[4] = {
+    -1.5104f, -0.4528f, 0.4528f, 1.5104f
+};
+
+// Flash attention K dot product for tq2_0
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq2_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tq2_0 * K_tq2 = (const block_tq2_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+    constexpr int n_blocks = D / QK_TQ2_0;
+    constexpr int qi_per_block = QK_TQ2_0 / (int)sizeof(int);
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        float cent[QK_TQ2_0];
+        for (int j = 0; j < QK_TQ2_0 / 4; j++) {
+            uint8_t packed = K_tq2[blk].qs[j];
+            cent[4*j + 0] = TQ2_0_CENTROIDS_FA[ packed       & 3];
+            cent[4*j + 1] = TQ2_0_CENTROIDS_FA[(packed >> 2) & 3];
+            cent[4*j + 2] = TQ2_0_CENTROIDS_FA[(packed >> 4) & 3];
+            cent[4*j + 3] = TQ2_0_CENTROIDS_FA[(packed >> 6) & 3];
+        }
+
+        const float k_scale = (float)K_tq2[blk].d * rsqrtf((float)QK_TQ2_0);
+
+#pragma unroll
+        for (int k_local_0 = 0; k_local_0 < qi_per_block; k_local_0 += nthreads) {
+            const int k_local = k_local_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            const int elem_start = k_local * 4;
+            const int q_reg_idx = (blk * qi_per_block + k_local_0) / nthreads;
+
+            const int u = Q_q8[q_reg_idx];
+            const int8_t * q8 = (const int8_t *)&u;
+            const float2 Q_ds = ((const float2 *) Q_ds_v)[q_reg_idx];
+
+            float block_sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                block_sum += cent[elem_start + j] * (float)q8[j];
+            }
+
+            sum += block_sum * Q_ds.x * k_scale;
+        }
+    }
+
+    return sum;
+}
+
+// Flash attention V dequantize for tq2_0
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq2_0 * x = (const block_tq2_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TQ2_0;
+    const int     iqs = i0 % QK_TQ2_0;
+
+    const float d = (float)x[ib].d;
+    const float k_scale = d * rsqrtf((float)QK_TQ2_0);
+
+    float cent[ne];
+    for (int l = 0; l < ne; l++) {
+        const int j = iqs + l;
+        uint8_t packed = x[ib].qs[j / 4];
+        uint8_t idx = (packed >> (2 * (j % 4))) & 3;
+        cent[l] = TQ2_0_CENTROIDS_FA[idx] * k_scale;
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(cent[l0], cent[l0 + 1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = cent[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+// TurboQuant tq4_0 constants for flash attention
+__device__ static const float TQ4_0_CENTROIDS_FA[16] = {
+    -2.7331f, -2.0696f, -1.6186f, -1.2568f, -0.9428f, -0.6571f, -0.3883f, -0.1285f,
+     0.1285f,  0.3883f,  0.6571f,  0.9428f,  1.2568f,  1.6186f,  2.0696f,  2.7331f
+};
+
+// Dequantize a full tq4_0 block into float[QK_TQ4_0]
+static __device__ __forceinline__ void dequantize_tq4_0_block(const block_tq4_0 * __restrict__ blk, float * __restrict__ out) {
+    const float d = blk->d;
+
+    for (int j = 0; j < QK_TQ4_0 / 2; j++) {
+        uint8_t packed = blk->qs[j];
+        out[2 * j]     = TQ4_0_CENTROIDS_FA[packed & 0xF];
+        out[2 * j + 1] = TQ4_0_CENTROIDS_FA[packed >> 4];
+    }
+
+    for (int step = 1; step < QK_TQ4_0; step <<= 1) {
+        for (int i = 0; i < QK_TQ4_0; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j]        = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+
+    const float norm_d = d / sqrtf((float)QK_TQ4_0);
+    for (int j = 0; j < QK_TQ4_0; j++) {
+        out[j] *= norm_d * TQ3_0_SIGNS_FA[j];
+    }
+}
+
+// Flash attention K dot product for tq4_0
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tq4_0 * K_tq4 = (const block_tq4_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+    constexpr int n_blocks = D / QK_TQ4_0;
+    constexpr int qi_per_block = QK_TQ4_0 / (int)sizeof(int);
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        float cent[QK_TQ4_0];
+        for (int j = 0; j < QK_TQ4_0 / 2; j++) {
+            uint8_t packed = K_tq4[blk].qs[j];
+            cent[2*j]     = TQ4_0_CENTROIDS_FA[packed & 0xF];
+            cent[2*j + 1] = TQ4_0_CENTROIDS_FA[packed >> 4];
+        }
+
+        const float k_scale = (float)K_tq4[blk].d * rsqrtf((float)QK_TQ4_0);
+
+#pragma unroll
+        for (int k_local_0 = 0; k_local_0 < qi_per_block; k_local_0 += nthreads) {
+            const int k_local = k_local_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            const int elem_start = k_local * 4;
+            const int q_reg_idx = (blk * qi_per_block + k_local_0) / nthreads;
+
+            const int u = Q_q8[q_reg_idx];
+            const int8_t * q8 = (const int8_t *)&u;
+            const float2 Q_ds = ((const float2 *) Q_ds_v)[q_reg_idx];
+
+            float block_sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                block_sum += cent[elem_start + j] * (float)q8[j];
+            }
+
+            sum += block_sum * Q_ds.x * k_scale;
+        }
+    }
+
+    return sum;
+}
+
+// Flash attention V dequantize for tq4_0
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq4_0 * x = (const block_tq4_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TQ4_0;
+    const int     iqs = i0 % QK_TQ4_0;
+
+    const float d = (float)x[ib].d;
+    const float k_scale = d * rsqrtf((float)QK_TQ4_0);
+
+    float cent[ne];
+    for (int l = 0; l < ne; l++) {
+        const int j = iqs + l;
+        uint8_t packed = x[ib].qs[j / 2];
+        uint8_t idx = (j & 1) ? (packed >> 4) : (packed & 0xF);
+        cent[l] = TQ4_0_CENTROIDS_FA[idx] * k_scale;
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(cent[l0], cent[l0 + 1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = cent[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -633,6 +1007,12 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ2_0) {
+        return vec_dot_fattn_vec_KQ_tq2_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ3_0) {
+        return vec_dot_fattn_vec_KQ_tq3_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ4_0) {
+        return vec_dot_fattn_vec_KQ_tq4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -655,6 +1035,12 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ2_0) {
+        return dequantize_V_tq2_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ3_0) {
+        return dequantize_V_tq3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ4_0) {
+        return dequantize_V_tq4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

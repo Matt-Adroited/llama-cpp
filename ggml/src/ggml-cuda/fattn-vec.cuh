@@ -121,6 +121,9 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+    constexpr bool is_tq_K = (type_K == GGML_TYPE_TQ2_0 || type_K == GGML_TYPE_TQ3_0 || type_K == GGML_TYPE_TQ4_0);
+    constexpr bool is_tq_V = (type_V == GGML_TYPE_TQ2_0 || type_V == GGML_TYPE_TQ3_0 || type_V == GGML_TYPE_TQ4_0);
+    constexpr bool is_tq = is_tq_K || is_tq_V;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
@@ -128,6 +131,8 @@ static __global__ void flash_attn_ext_vec(
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
+    // For TQ types: dedicated shared buffer for Q-side WHT rotation
+    __shared__ float Q_tq_buf[is_tq ? ncols * D : 1];
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -148,43 +153,134 @@ static __global__ void flash_attn_ext_vec(
 
     ggml_cuda_pdl_sync();
     if constexpr (Q_q8_1) {
+        if constexpr (is_tq_K) {
+            // TQ optimized path: load Q as float, apply WHT(signs*Q), then quantize to q8_1
 #pragma unroll
-        for (int j0 = 0; j0 < ncols; j0 += nwarps) {
-            const int j = j0 + threadIdx.y;
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+                if (j0 + nwarps > ncols && j >= ncols) {
+                    break;
+                }
 
-            if (j0 + nwarps > ncols && j >= ncols) {
-                break;
-            }
+                int    * tmp_q_i32 = (int    *) &KQ[j*D];
+                float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
 
-            // Reuse KQ as temporary storage for converting Q to q8_1:
-            int    * tmp_q_i32 = (int    *) &KQ[j*D];
-            float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
-
-            // Set memory to zero if out of bounds:
-            if (ncols > 1 && ic0 + j >= int(ne01.z)) {
+                if (ncols > 1 && ic0 + j >= int(ne01.z)) {
 #pragma unroll
-                for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
-                    const int i = i0 + threadIdx.x;
-
-                    if (i0 + WARP_SIZE <= int(D/sizeof(int)) || i < int(D/sizeof(int))) {
-                        tmp_q_i32[i] = 0;
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
+                        const int i = i0 + threadIdx.x;
+                        if (i0 + WARP_SIZE <= int(D/sizeof(int)) || i < int(D/sizeof(int))) {
+                            tmp_q_i32[i] = 0;
+                        }
+                    }
+                    if (threadIdx.x < D/QK8_1) {
+                        tmp_q_ds[threadIdx.x] = make_float2(0.0f, 0.0f);
+                    }
+                } else {
+                    // Load Q as float into dedicated shared buffer
+                    const float * Q_f = (const float *) (Q + j*nb01);
+                    float * Q_buf = Q_tq_buf + j * D;
+                    for (int i = threadIdx.x; i < D; i += WARP_SIZE) {
+                        Q_buf[i] = Q_f[i];
                     }
                 }
-                if (threadIdx.x < D/QK8_1) {
-                    tmp_q_ds[threadIdx.x] = make_float2(0.0f, 0.0f);
-                }
-            } else {
-                const float * Q_f = (const float *) (Q + j*nb01);
-                constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+            }
+
+            __syncthreads();
+
+            // Apply sign flips + forward WHT per TQ block (single thread per column)
+            constexpr int tq_blk_size = (type_K == GGML_TYPE_TQ2_0) ? QK_TQ2_0 :
+                                            (type_K == GGML_TYPE_TQ3_0) ? QK_TQ3_0 : QK_TQ4_0;
 #pragma unroll
-                for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
-                    quantize_q8_1_to_shared<float2, nthreads_quantize>
-                        (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+                if (j < ncols && threadIdx.x == 0 && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                    float * Q_buf = Q_tq_buf + j * D;
+                    for (int b = 0; b < D / tq_blk_size; b++) {
+                        float * blk = Q_buf + b * tq_blk_size;
+                        // Sign flips
+                        for (int i = 0; i < tq_blk_size; i++) {
+                            blk[i] *= TQ3_0_SIGNS_FA[i];
+                        }
+                        // Forward WHT butterfly
+                        for (int step = 1; step < tq_blk_size; step <<= 1) {
+                            for (int i = 0; i < tq_blk_size; i += step << 1) {
+                                for (int k = i; k < i + step; k++) {
+                                    float a = blk[k];
+                                    float bv = blk[k + step];
+                                    blk[k]        = a + bv;
+                                    blk[k + step] = a - bv;
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        __syncthreads();
+            __syncthreads();
+
+            // Quantize WHT-rotated Q to q8_1
+#pragma unroll
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+                if (j0 + nwarps > ncols && j >= ncols) {
+                    break;
+                }
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    float * Q_buf = Q_tq_buf + j * D;
+                    int    * tmp_q_i32 = (int    *) &KQ[j*D];
+                    float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
+
+                    constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+#pragma unroll
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+                        quantize_q8_1_to_shared<float2, nthreads_quantize>
+                            (Q_buf + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    }
+                }
+            }
+
+            __syncthreads();
+        } else {
+            // Standard (non-TQ) path
+#pragma unroll
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+
+                if (j0 + nwarps > ncols && j >= ncols) {
+                    break;
+                }
+
+                // Reuse KQ as temporary storage for converting Q to q8_1:
+                int    * tmp_q_i32 = (int    *) &KQ[j*D];
+                float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
+
+                // Set memory to zero if out of bounds:
+                if (ncols > 1 && ic0 + j >= int(ne01.z)) {
+#pragma unroll
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
+                        const int i = i0 + threadIdx.x;
+
+                        if (i0 + WARP_SIZE <= int(D/sizeof(int)) || i < int(D/sizeof(int))) {
+                            tmp_q_i32[i] = 0;
+                        }
+                    }
+                    if (threadIdx.x < D/QK8_1) {
+                        tmp_q_ds[threadIdx.x] = make_float2(0.0f, 0.0f);
+                    }
+                } else {
+                    const float * Q_f = (const float *) (Q + j*nb01);
+                    constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+#pragma unroll
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+                        quantize_q8_1_to_shared<float2, nthreads_quantize>
+                            (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    }
+                }
+            }
+
+            __syncthreads();
+        }
 
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
@@ -487,20 +583,79 @@ static __global__ void flash_attn_ext_vec(
             KQ_sum[j_VKQ] = KQ_sum_shared[j_VKQ][threadIdx.x];
             KQ_sum[j_VKQ] = warp_reduce_sum(KQ_sum[j_VKQ]);
 
+            if constexpr (is_tq_V) {
+                // TQ V optimization: VKQ was accumulated in rotated space (raw centroids * scale).
+                // Now apply inverse transform: WHT + sign flips to get back to original space.
+                constexpr int tq_blk_size = (type_V == GGML_TYPE_TQ2_0) ? QK_TQ2_0 :
+                                            (type_V == GGML_TYPE_TQ3_0) ? QK_TQ3_0 :
+                                            (type_V == GGML_TYPE_TQ4_0) ? QK_TQ4_0 : 128;
+
+                // Sum across warps into Q_tq_buf (reuse the shared float buffer)
 #pragma unroll
-            for (int i0 = 0; i0 < D; i0 += nthreads) {
-                float dst_val = 0;
+                for (int i0 = 0; i0 < D; i0 += nthreads) {
+                    float dst_val = 0;
 #pragma unroll
-                for (int w = 0; w < nwarps; ++w) {
+                    for (int w = 0; w < nwarps; ++w) {
 #pragma unroll
-                    for (int v = 0; v < V_cols_per_iter; ++v) {
-                        dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
+                        for (int v = 0; v < V_cols_per_iter; ++v) {
+                            dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
+                        }
+                    }
+                    Q_tq_buf[i0 + tid] = dst_val;
+                }
+
+                __syncthreads();
+
+                // Apply WHT + signs per TQ block (single thread for simplicity)
+                if (threadIdx.x == 0 && threadIdx.y == 0) {
+                    for (int b = 0; b < D / tq_blk_size; b++) {
+                        float * blk = Q_tq_buf + b * tq_blk_size;
+                        // Inverse WHT (same butterfly as forward - WHT is self-inverse up to scale)
+                        for (int step = 1; step < tq_blk_size; step <<= 1) {
+                            for (int i = 0; i < tq_blk_size; i += step << 1) {
+                                for (int k = i; k < i + step; k++) {
+                                    float a = blk[k];
+                                    float bv = blk[k + step];
+                                    blk[k]        = a + bv;
+                                    blk[k + step] = a - bv;
+                                }
+                            }
+                        }
+                        // Apply sign flips
+                        for (int i = 0; i < tq_blk_size; i++) {
+                            blk[i] *= TQ3_0_SIGNS_FA[i];
+                        }
                     }
                 }
-                if (gridDim.y == 1) {
-                    dst_val /= KQ_sum[j_VKQ];
+
+                __syncthreads();
+
+                // Write to dst
+#pragma unroll
+                for (int i0 = 0; i0 < D; i0 += nthreads) {
+                    float dst_val = Q_tq_buf[i0 + tid];
+                    if (gridDim.y == 1) {
+                        dst_val /= KQ_sum[j_VKQ];
+                    }
+                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
                 }
-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+            } else {
+                // Original path for non-TQ types
+#pragma unroll
+                for (int i0 = 0; i0 < D; i0 += nthreads) {
+                    float dst_val = 0;
+#pragma unroll
+                    for (int w = 0; w < nwarps; ++w) {
+#pragma unroll
+                        for (int v = 0; v < V_cols_per_iter; ++v) {
+                            dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
+                        }
+                    }
+                    if (gridDim.y == 1) {
+                        dst_val /= KQ_sum[j_VKQ];
+                    }
+                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+                }
             }
         }
 
@@ -585,6 +740,9 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q5_1); \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q8_0); \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_BF16); \
+    extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_TQ2_0); \
+    extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_TQ3_0); \
+    extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_TQ4_0); \
 
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_F16)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q4_0)
@@ -593,6 +751,9 @@ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_BF16)
+EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_TQ2_0)
+EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_TQ3_0)
+EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_TQ4_0)
 
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_F16)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q4_0)
@@ -601,6 +762,9 @@ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_BF16)
+EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_TQ2_0)
+EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_TQ3_0)
+EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_TQ4_0)
 
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_F16)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q4_0)
@@ -609,3 +773,6 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_TQ2_0)
+EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_TQ3_0)
+EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_TQ4_0)

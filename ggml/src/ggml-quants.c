@@ -2307,34 +2307,61 @@ void quantize_row_tq1_0_ref(const float * GGML_RESTRICT x, block_tq1_0 * GGML_RE
     }
 }
 
+// Lloyd-Max 4-level codebook centroids for N(0,1)
+static const float TQ2_0_CENTROIDS[4] = {
+    -1.5104f, -0.4528f, 0.4528f, 1.5104f
+};
+
+// Decision boundaries between centroids
+static const float TQ2_0_BOUNDARIES[3] = {
+    -0.9816f, 0.0f, 0.9816f
+};
+
+// Forward declarations (defined below in TQ3_0 section)
+static void tq3_0_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTRICT out);
+static void tq3_0_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out);
+
 void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
+    assert(k % QK_TQ2_0 == 0);
+    const int64_t nb = k / QK_TQ2_0;
+
+    float rotated[QK_TQ2_0];
 
     for (int64_t i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
+        const float * block_x = x + i * QK_TQ2_0;
 
-        for (int j = 0; j < QK_K; j++) {
-            const float v = x[j];
-            amax = MAX(amax, fabsf(v));
+        // 1. Compute RMS scale
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_TQ2_0; j++) {
+            sum_sq += block_x[j] * block_x[j];
+        }
+        float rms = sqrtf(sum_sq / QK_TQ2_0);
+        if (rms < 1e-10f) { rms = 1.0f; }
+
+        y[i].d = GGML_FP32_TO_FP16(rms);
+
+        // 2. Normalize to unit variance
+        float normalized[QK_TQ2_0];
+        const float inv_rms = 1.0f / rms;
+        for (int j = 0; j < QK_TQ2_0; j++) {
+            normalized[j] = block_x[j] * inv_rms;
         }
 
-        const float d = amax;
-        const float id = d ? 1.0f/d : 0.0f;
+        // 3. Apply randomized Hadamard transform (same signs/WHT as TQ3_0/TQ4_0)
+        tq3_0_rht_forward(normalized, rotated);
 
-        y[i].d = GGML_FP32_TO_FP16(d);
-
-        for (size_t j = 0; j < sizeof(y->qs); j += 32) {
-            for (size_t m = 0; m < 32; ++m) {
-                uint8_t q = 0;
-                for (size_t n = 0; n < 4; ++n) {
-                    // -1, 0, 1 -> 0, 1, 2
-                    int xi = lroundf(x[m + n*32] * id) + 1;
-                    q += (xi & 3) << (2*n);
+        // 4. Quantize to 2-bit Lloyd-Max indices and pack (4 indices per byte)
+        for (int j = 0; j < QK_TQ2_0 / 4; j++) {
+            uint8_t packed = 0;
+            for (int n = 0; n < 4; n++) {
+                float v = rotated[4 * j + n];
+                uint8_t idx = 0;
+                for (int b = 0; b < 3; b++) {
+                    if (v > TQ2_0_BOUNDARIES[b]) { idx = b + 1; }
                 }
-                y[i].qs[j + m] = q;
+                packed |= (idx << (2 * n));
             }
-            x += 4*32;
+            y[i].qs[j] = packed;
         }
     }
 }
@@ -2347,9 +2374,9 @@ size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 }
 
 size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    (void)quant_weights; // not used
+    (void)quant_weights;
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_0, n_per_row);
-    quantize_row_tq2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    quantize_row_tq2_0_ref(src, (block_tq2_0 *)dst, (int64_t)nrow * n_per_row);
     return nrow * row_size;
 }
 
@@ -2393,22 +2420,317 @@ void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_REST
 }
 
 void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
+    assert(k % QK_TQ2_0 == 0);
+    const int64_t nb = k / QK_TQ2_0;
 
-    for (int64_t i = 0; i < nb; ++i) {
-
+    for (int64_t i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
 
-        for (size_t j = 0; j < sizeof(x->qs); j += 32) {
-            for (size_t l = 0; l < 4; ++l) {
-                for (size_t m = 0; m < 32; ++m) {
-                    int8_t q = (x[i].qs[j + m] >> (l*2)) & 3;
-                    *y++ = (float) (q - 1) * d;
-                }
+        // 1. Unpack 2-bit indices and look up centroids
+        float rotated[QK_TQ2_0];
+        for (int j = 0; j < QK_TQ2_0 / 4; j++) {
+            uint8_t packed = x[i].qs[j];
+            rotated[4*j + 0] = TQ2_0_CENTROIDS[(packed >> 0) & 3];
+            rotated[4*j + 1] = TQ2_0_CENTROIDS[(packed >> 2) & 3];
+            rotated[4*j + 2] = TQ2_0_CENTROIDS[(packed >> 4) & 3];
+            rotated[4*j + 3] = TQ2_0_CENTROIDS[(packed >> 6) & 3];
+        }
+
+        // 2. Apply inverse WHT (undo rotation)
+        float dequantized[QK_TQ2_0];
+        tq3_0_rht_inverse(rotated, dequantized);
+
+        // 3. Apply scale
+        for (int j = 0; j < QK_TQ2_0; j++) {
+            y[i * QK_TQ2_0 + j] = dequantized[j] * d;
+        }
+    }
+}
+
+//
+// TurboQuant TQ3_0: WHT rotation + 3-bit Lloyd-Max codebook (8 levels)
+//
+
+// Lloyd-Max 8-level codebook centroids for N(0,1)
+static const float TQ3_0_CENTROIDS[8] = {
+    -1.7479f, -1.0500f, -0.5006f, -0.0000f,
+     0.0000f,  0.5006f,  1.0500f,  1.7479f
+};
+
+// Decision boundaries (midpoints between adjacent centroids)
+static const float TQ3_0_BOUNDARIES[7] = {
+    -1.3990f, -0.7753f, -0.2503f, 0.0f, 0.2503f, 0.7753f, 1.3990f
+};
+
+// Pseudo-random sign flip pattern for WHT (128 elements for QK=128)
+static const float TQ3_0_SIGNS[128] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f,
+    -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f,
+    +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f,
+    +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f,
+    +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f,
+    +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, +1.0f,
+};
+
+// Forward randomized Hadamard transform: sign flips + WHT + normalize
+static void tq3_0_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    // Apply sign flips
+    for (int i = 0; i < QK_TQ3_0; i++) {
+        out[i] = in[i] * TQ3_0_SIGNS[i];
+    }
+
+    // In-place WHT butterfly (log2(QK_TQ3_0) stages)
+    for (int step = 1; step < QK_TQ3_0; step <<= 1) {
+        for (int i = 0; i < QK_TQ3_0; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j]        = a + b;
+                out[j + step] = a - b;
             }
         }
     }
+
+    // Normalize by 1/sqrt(QK_TQ3_0)
+    const float norm = 1.0f / sqrtf((float)QK_TQ3_0);
+    for (int i = 0; i < QK_TQ3_0; i++) {
+        out[i] *= norm;
+    }
+}
+
+// Inverse randomized Hadamard transform: WHT + normalize + un-sign-flip
+static void tq3_0_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    for (int i = 0; i < QK_TQ3_0; i++) {
+        out[i] = in[i];
+    }
+
+    // In-place WHT butterfly (same as forward - WHT is self-inverse up to scale)
+    for (int step = 1; step < QK_TQ3_0; step <<= 1) {
+        for (int i = 0; i < QK_TQ3_0; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j]        = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+
+    // Normalize and undo sign flips
+    const float norm = 1.0f / sqrtf((float)QK_TQ3_0);
+    for (int i = 0; i < QK_TQ3_0; i++) {
+        out[i] *= norm * TQ3_0_SIGNS[i];
+    }
+}
+
+void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    const int64_t nb = k / QK_TQ3_0;
+
+    float rotated[QK_TQ3_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * block_x = x + i * QK_TQ3_0;
+
+        // 1. Compute RMS scale
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            sum_sq += block_x[j] * block_x[j];
+        }
+        float rms = sqrtf(sum_sq / QK_TQ3_0);
+        if (rms < 1e-10f) { rms = 1.0f; }
+
+        y[i].d = GGML_FP32_TO_FP16(rms);
+
+        // 2. Normalize to unit variance
+        float normalized[QK_TQ3_0];
+        const float inv_rms = 1.0f / rms;
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            normalized[j] = block_x[j] * inv_rms;
+        }
+
+        // 3. Apply randomized Hadamard transform
+        tq3_0_rht_forward(normalized, rotated);
+
+        // 4. Scalar quantize each element to nearest Lloyd-Max centroid
+        uint8_t indices[QK_TQ3_0];
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            float v = rotated[j];
+            uint8_t idx = 0;
+            for (int b = 0; b < 7; b++) {
+                if (v > TQ3_0_BOUNDARIES[b]) { idx = b + 1; }
+            }
+            indices[j] = idx;
+        }
+
+        // 5. Pack 3-bit indices: 8 indices -> 3 bytes (24 bits)
+        for (int g = 0; g < QK_TQ3_0 / 8; g++) {
+            const uint8_t * idx = indices + g * 8;
+            uint8_t * qp = y[i].qs + g * 3;
+            qp[0] = (idx[0])      | (idx[1] << 3) | (idx[2] << 6);
+            qp[1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);
+            qp[2] = (idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5);
+        }
+    }
+}
+
+void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    const int64_t nb = k / QK_TQ3_0;
+
+    float rotated[QK_TQ3_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // 1. Unpack 3-bit indices
+        uint8_t indices[QK_TQ3_0];
+        for (int g = 0; g < QK_TQ3_0 / 8; g++) {
+            const uint8_t * qp = x[i].qs + g * 3;
+            uint8_t * idx = indices + g * 8;
+            idx[0] =  qp[0]       & 7;
+            idx[1] = (qp[0] >> 3) & 7;
+            idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
+            idx[3] = (qp[1] >> 1) & 7;
+            idx[4] = (qp[1] >> 4) & 7;
+            idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
+            idx[6] = (qp[2] >> 2) & 7;
+            idx[7] = (qp[2] >> 5) & 7;
+        }
+
+        // 2. Look up centroids
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            rotated[j] = TQ3_0_CENTROIDS[indices[j]];
+        }
+
+        // 3. Apply inverse WHT
+        float dequantized[QK_TQ3_0];
+        tq3_0_rht_inverse(rotated, dequantized);
+
+        // 4. Scale
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            y[i * QK_TQ3_0 + j] = dequantized[j] * d;
+        }
+    }
+}
+
+size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);
+    quantize_row_tq3_0_ref(src, (block_tq3_0 *)dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+//
+// TurboQuant TQ4_0: WHT rotation + 4-bit Lloyd-Max codebook (16 levels)
+//
+
+// Lloyd-Max 16-level codebook centroids for N(0,1)
+static const float TQ4_0_CENTROIDS[16] = {
+    -2.7331f, -2.0696f, -1.6186f, -1.2568f, -0.9428f, -0.6571f, -0.3883f, -0.1285f,
+     0.1285f,  0.3883f,  0.6571f,  0.9428f,  1.2568f,  1.6186f,  2.0696f,  2.7331f
+};
+
+// Decision boundaries (midpoints between adjacent centroids)
+static const float TQ4_0_BOUNDARIES[15] = {
+    -2.4013f, -1.8441f, -1.4377f, -1.0998f, -0.8000f, -0.5227f, -0.2584f, 0.0f,
+     0.2584f,  0.5227f,  0.8000f,  1.0998f,  1.4377f,  1.8441f,  2.4013f
+};
+
+// Reuse the same sign flip pattern and WHT as TQ3_0 (same block size = 128)
+// Forward/inverse RHT are shared since QK_TQ4_0 == QK_TQ3_0
+
+void quantize_row_tq4_0_ref(const float * GGML_RESTRICT x, block_tq4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ4_0 == 0);
+    const int64_t nb = k / QK_TQ4_0;
+
+    float rotated[QK_TQ4_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * block_x = x + i * QK_TQ4_0;
+
+        // 1. Compute RMS scale
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_TQ4_0; j++) {
+            sum_sq += block_x[j] * block_x[j];
+        }
+        float rms = sqrtf(sum_sq / QK_TQ4_0);
+        if (rms < 1e-10f) { rms = 1.0f; }
+
+        y[i].d = GGML_FP32_TO_FP16(rms);
+
+        // 2. Normalize to unit variance
+        float normalized[QK_TQ4_0];
+        const float inv_rms = 1.0f / rms;
+        for (int j = 0; j < QK_TQ4_0; j++) {
+            normalized[j] = block_x[j] * inv_rms;
+        }
+
+        // 3. Apply randomized Hadamard transform (same signs as TQ3_0)
+        tq3_0_rht_forward(normalized, rotated);
+
+        // 4. Scalar quantize each element to nearest Lloyd-Max centroid (4-bit = 16 levels)
+        //    Pack two 4-bit indices per byte (low nibble = even index, high nibble = odd index)
+        for (int j = 0; j < QK_TQ4_0 / 2; j++) {
+            float v0 = rotated[2 * j];
+            float v1 = rotated[2 * j + 1];
+
+            uint8_t idx0 = 0;
+            for (int b = 0; b < 15; b++) {
+                if (v0 > TQ4_0_BOUNDARIES[b]) { idx0 = b + 1; }
+            }
+            uint8_t idx1 = 0;
+            for (int b = 0; b < 15; b++) {
+                if (v1 > TQ4_0_BOUNDARIES[b]) { idx1 = b + 1; }
+            }
+
+            y[i].qs[j] = idx0 | (idx1 << 4);
+        }
+    }
+}
+
+void dequantize_row_tq4_0(const block_tq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ4_0 == 0);
+    const int64_t nb = k / QK_TQ4_0;
+
+    float rotated[QK_TQ4_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // 1. Unpack 4-bit indices and look up centroids
+        for (int j = 0; j < QK_TQ4_0 / 2; j++) {
+            uint8_t packed = x[i].qs[j];
+            rotated[2 * j]     = TQ4_0_CENTROIDS[packed & 0xF];
+            rotated[2 * j + 1] = TQ4_0_CENTROIDS[packed >> 4];
+        }
+
+        // 2. Apply inverse WHT (undo rotation)
+        float dequantized[QK_TQ4_0];
+        tq3_0_rht_inverse(rotated, dequantized);
+
+        // 3. Scale back
+        for (int j = 0; j < QK_TQ4_0; j++) {
+            y[i * QK_TQ4_0 + j] = dequantized[j] * d;
+        }
+    }
+}
+
+size_t quantize_tq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ4_0, n_per_row);
+    quantize_row_tq4_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
 }
 
 // ====================== "True" 2-bit (de)-quantization
@@ -5527,6 +5849,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq3_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ4_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq4_0, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {
