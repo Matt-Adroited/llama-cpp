@@ -1369,6 +1369,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefix-cache-blocks"},
+        "N",
+        string_format("max number of prefix blocks to cache for reuse across slots (default: %d, 0 = disabled, requires --kv-unified)", params.prefix_cache_blocks),
+        [](common_params & params, int value) {
+            params.prefix_cache_blocks = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-block-size"},
+        "N",
+        string_format("tokens per prefix cache block (default: %d)", params.prefix_block_size),
+        [](common_params & params, int value) {
+            params.prefix_block_size = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

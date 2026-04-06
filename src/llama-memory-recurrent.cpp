@@ -170,8 +170,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     // models like Mamba or RWKV can't have a state partially erased at the end
     // of the sequence because their state isn't preserved for previous tokens
     if (seq_id >= (int64_t) size) {
-        // could be fatal
-        return false;
+        // seq_id is out of range for recurrent memory — nothing to remove, treat as success
+        return true;
     }
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;

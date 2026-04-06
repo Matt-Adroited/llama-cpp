@@ -4,6 +4,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-prefix-cache.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -129,6 +130,10 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+
+    // prefix block cache: blocks attached to this slot via seq_cp
+    std::vector<prefix_block *> prefix_blocks_attached;
+    bool                        using_prefix_cache = false;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -811,6 +816,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    server_prefix_block_cache prefix_cache;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();    // Primary: new name
@@ -1179,6 +1186,13 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // detach prefix blocks when slot is released
+                auto & s = slots[id_slot];
+                if (!s.prefix_blocks_attached.empty()) {
+                    prefix_cache.detach(s.prefix_blocks_attached);
+                    s.prefix_blocks_attached.clear();
+                }
             };
 
             slot.reset();
@@ -1228,6 +1242,21 @@ private:
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_INF("%s", "context checkpoints disabled\n");
+        }
+
+        // initialize block-level prefix cache (only useful in unified mode)
+        if (params_base.kv_unified) {
+            prefix_cache.block_size  = params_base.prefix_block_size > 0 ? params_base.prefix_block_size : 4096;
+            prefix_cache.max_blocks  = params_base.prefix_cache_blocks > 0 ? params_base.prefix_cache_blocks : 192;
+            prefix_cache.enabled     = (params_base.prefix_cache_blocks != 0);
+            prefix_cache.init();
+            if (prefix_cache.enabled) {
+                SRV_WRN("prefix block cache enabled: %d blocks x %d tokens = %d max cached tokens\n",
+                         prefix_cache.max_blocks, prefix_cache.block_size,
+                         prefix_cache.max_blocks * prefix_cache.block_size);
+            }
+        } else {
+            prefix_cache.enabled = false;
         }
 
         if (!params_base.model_alias.empty()) {
@@ -1377,11 +1406,126 @@ private:
 
         return nullptr;
     }
+    // register completed blocks from a slot's prompt into the prefix block cache
+    void register_prefix_blocks(server_slot & slot, const server_tokens & input_tokens) {
+        if (!prefix_cache.enabled) {
+            return;
+        }
+
+        const int bs = prefix_cache.block_size;
+        const int n_tokens = slot.prompt.n_tokens();
+        const int n_full_blocks = n_tokens / bs;
+
+        if (n_full_blocks == 0) {
+            return;
+        }
+
+        int n_registered = 0;
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+        SLT_INF(slot, "prefix block registration: %d tokens, %d full blocks of %d\n",
+                n_tokens, n_full_blocks, bs);
+
+        for (int b = 0; b < n_full_blocks; b++) {
+            llama_pos pos_start = (llama_pos)(b * bs);
+            const llama_token * block_tokens = &input_tokens[b * bs];
+            uint64_t h = prefix_cache.compute_hash(block_tokens, bs, pos_start);
+
+            // skip if already registered
+            if (prefix_cache.blocks.count(h)) {
+                continue;
+            }
+
+            // check if we need to evict blocks to make room
+            if (prefix_cache.num_blocks() >= prefix_cache.max_blocks) {
+                auto evicted = prefix_cache.evict_lru(1);
+                for (const auto & e : evicted) {
+                    llama_memory_seq_rm(mem, e.template_seq, -1, -1);
+                }
+                if (evicted.empty()) {
+                    break; // can't evict, cache is full of referenced blocks
+                }
+            }
+
+            // allocate a template seq_id
+            llama_seq_id tseq = prefix_cache.alloc_template_seq();
+            if (tseq < 0) {
+                break; // exhausted template seq_ids
+            }
+
+            // share the KV cells from this slot to the template seq_id
+            llama_memory_seq_cp(mem, slot.id, tseq, pos_start, pos_start + bs);
+
+            // register the block
+            prefix_block * block = prefix_cache.register_block(block_tokens, bs, pos_start, tseq);
+            if (!block) {
+                prefix_cache.free_template_seq(tseq);
+                // remove the seq_cp we just did
+                llama_memory_seq_rm(mem, tseq, pos_start, pos_start + bs);
+                continue;
+            }
+
+            n_registered++;
+        }
+
+        if (n_registered > 0) {
+            SLT_INF(slot, "registered %d prefix blocks (%d tokens) in block cache\n",
+                    n_registered, n_registered * bs);
+        }
+    }
+
+    // register RS checkpoint for the last complete block boundary of a slot
+    void register_prefix_rs_checkpoint(server_slot & slot, const server_tokens & input_tokens) {
+        if (!prefix_cache.enabled) {
+            return;
+        }
+
+        const int bs = prefix_cache.block_size;
+        const int n_tokens = slot.prompt.n_tokens();
+        const int n_full_blocks = n_tokens / bs;
+
+        if (n_full_blocks == 0) {
+            return;
+        }
+
+        // find the last registered block
+        int last_block_idx = n_full_blocks - 1;
+        llama_pos pos_start = (llama_pos)(last_block_idx * bs);
+        const llama_token * block_tokens = &input_tokens[last_block_idx * bs];
+        uint64_t h = prefix_cache.compute_hash(block_tokens, bs, pos_start);
+
+        auto it = prefix_cache.blocks.find(h);
+        if (it == prefix_cache.blocks.end() || !it->second.rs_data.empty()) {
+            return; // not found or already has checkpoint
+        }
+
+        // capture the recurrent state at this point
+        const size_t rs_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (rs_size == 0) {
+            return; // no recurrent state (pure attention model)
+        }
+
+        std::vector<uint8_t> rs_data(rs_size);
+        const size_t written = llama_state_seq_get_data_ext(ctx_tgt, rs_data.data(), rs_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (written > 0) {
+            rs_data.resize(written);
+            prefix_cache.store_rs_checkpoint(&it->second, rs_data);
+            SLT_INF(slot, "stored RS checkpoint for block %d (%zu bytes)\n", last_block_idx, written);
+        }
+    }
 
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+
+        // check prefix block cache first (only in unified mode)
+        int prefix_cache_tokens = 0;
+        prefix_match_result prefix_match = {};
+        if (prefix_cache.enabled && !task.tokens.empty()) {
+            prefix_match = prefix_cache.find_matches(task.tokens);
+            prefix_cache_tokens = prefix_match.n_cached_tokens;
+        }
 
         // find the slot that has at least n% prompt similarity
         if (ret == nullptr && slot_prompt_similarity != 0.0f) {
@@ -1412,14 +1556,49 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                const int slot_lcp_tokens = (int)(sim_best * task.tokens.size());
 
-                SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                        sim_best, slot_prompt_similarity, f_keep);
+                // if prefix block cache provides better coverage, prefer an empty slot instead
+                if (prefix_cache_tokens > slot_lcp_tokens) {
+                    SRV_WRN("prefix block cache has %d tokens > slot LCP %d tokens, looking for empty slot\n",
+                             prefix_cache_tokens, slot_lcp_tokens);
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
+                    server_slot * empty_slot = nullptr;
+                    int64_t t_last_empty = -1;
+                    for (server_slot & slot : slots) {
+                        if (slot.is_processing()) {
+                            continue;
+                        }
+                        if (slot.prompt.tokens.empty()) {
+                            if (!empty_slot || slot.t_last_used <= t_last_empty) {
+                                t_last_empty = slot.t_last_used;
+                                empty_slot = &slot;
+                            }
+                        }
+                    }
+
+                    if (empty_slot) {
+                        ret = empty_slot;
+                        ret->using_prefix_cache = true;
+                        SLT_INF(*ret, "selected empty slot for prefix block cache (%d cached tokens)\n",
+                                prefix_cache_tokens);
+                    } else {
+                        // no empty slot, use the LCP slot but mark for prefix cache use if applicable
+                        if (prefix_cache_tokens > slot_lcp_tokens) {
+                            ret->using_prefix_cache = true;
+                            update_cache = true;
+                        }
+                    }
+                } else {
+                    const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+
+                    SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                            sim_best, slot_prompt_similarity, f_keep);
+
+                    // if we are about to lose a large portion of the existing context - save it in the prompt cache
+                    if (f_keep < 0.5f) {
+                        update_cache = true;
+                    }
                 }
             }
         }
@@ -1443,6 +1622,12 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+
+                // if prefix block cache has blocks for this prompt, use them
+                if (prefix_cache_tokens > 0) {
+                    ret->using_prefix_cache = true;
+                    SLT_INF(*ret, "LRU slot will use prefix block cache (%d cached tokens)\n", prefix_cache_tokens);
+                }
 
                 update_cache = true;
             }
@@ -2811,8 +2996,80 @@ private:
                             }
 
                             if (slot.task->params.cache_prompt) {
-                                // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                // try prefix block cache first (if this slot was selected for it)
+                                if (slot.using_prefix_cache && prefix_cache.enabled) {
+                                    SLT_INF(slot, "checking prefix block cache (%d blocks registered)\n",
+                                            prefix_cache.num_blocks());
+                                    auto match = prefix_cache.find_matches(input_tokens);
+                                    SLT_INF(slot, "prefix block cache: found %d matching blocks (%d tokens)\n",
+                                            match.n_matched_blocks, match.n_cached_tokens);
+                                    if (match.n_cached_tokens > 0) {
+                                        // clear the slot's existing KV cache
+                                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+
+                                        // attach matched blocks: seq_cp each block's template -> slot
+                                        llama_memory_t mem = llama_get_memory(ctx_tgt);
+                                        for (auto * block : match.matched_blocks) {
+                                            // debug: check template seq positions before copy
+                                            llama_pos t_min = llama_memory_seq_pos_min(mem, block->template_seq);
+                                            llama_pos t_max = llama_memory_seq_pos_max(mem, block->template_seq);
+                                            SLT_INF(slot, "seq_cp template_seq=%d -> slot=%d [%d, %d) template_pos_min=%d template_pos_max=%d\n",
+                                                    block->template_seq, slot.id,
+                                                    (int)block->pos_start, (int)(block->pos_start + block->n_tokens),
+                                                    (int)t_min, (int)t_max);
+                                            llama_memory_seq_cp(mem, block->template_seq, slot.id,
+                                                                block->pos_start,
+                                                                block->pos_start + block->n_tokens);
+                                            // debug: check slot positions after each copy
+                                            llama_pos s_min = llama_memory_seq_pos_min(mem, slot.id);
+                                            llama_pos s_max = llama_memory_seq_pos_max(mem, slot.id);
+                                            SLT_INF(slot, "  after seq_cp: slot pos_min=%d pos_max=%d\n",
+                                                    (int)s_min, (int)s_max);
+                                        }
+
+                                        // restore recurrent state from the last block's checkpoint
+                                        if (match.has_rs_checkpoint) {
+                                            auto * last_block = match.matched_blocks.back();
+                                            if (!last_block->rs_data.empty()) {
+                                                llama_state_seq_set_data_ext(
+                                                    ctx_tgt,
+                                                    last_block->rs_data.data(),
+                                                    last_block->rs_data.size(),
+                                                    slot.id,
+                                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            }
+                                        }
+
+                                        prefix_cache.attach(match.matched_blocks);
+                                        slot.prefix_blocks_attached = match.matched_blocks;
+                                        n_past = match.n_cached_tokens;
+
+                                        // debug: check position consistency
+                                        {
+                                            llama_memory_t mem_dbg = llama_get_memory(ctx_tgt);
+                                            llama_pos pos_min = llama_memory_seq_pos_min(mem_dbg, slot.id);
+                                            llama_pos pos_max = llama_memory_seq_pos_max(mem_dbg, slot.id);
+                                            SLT_INF(slot, "after prefix restore: pos_min=%d pos_max=%d n_past=%d\n",
+                                                    (int)pos_min, (int)pos_max, n_past);
+                                        }
+
+                                        // update the slot's prompt tokens to reflect the cached prefix
+                                        slot.prompt.tokens.clear();
+                                        for (int i = 0; i < n_past; i++) {
+                                            slot.prompt.tokens.push_back(input_tokens[i]);
+                                        }
+
+                                        SLT_INF(slot, "prefix block cache: restored %d blocks, %d tokens\n",
+                                                match.n_matched_blocks, match.n_cached_tokens);
+                                    }
+
+                                    slot.using_prefix_cache = false; // consumed
+                                }
+
+                                if (n_past == 0) {
+                                    // reuse any previously computed tokens that are common with the new prompt
+                                    n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3039,9 +3296,16 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    if (!slot.prefix_blocks_attached.empty()) {
+                        // after prefix block restore via seq_cp, the KV cache is already clean
+                        // (only positions 0..n_past-1 exist). Skip truncation to avoid
+                        // recurrent memory's partial truncation rejection.
+                        SLT_INF(slot, "skipping truncation after prefix block restore (n_past = %d)\n", slot.prompt.n_tokens());
+                    } else {
+                        common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -3184,11 +3448,21 @@ private:
                         slot.i_batch   = batch.n_tokens - 1;
 
                         slot.init_sampler();
+                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+
+                        // note: prefix blocks are now registered incrementally during prompt processing
+                        // (at each block boundary crossing) so RS checkpoints are captured
+                        // at the exact position they represent
                     } else {
                         // skip ordinary mid-prompt checkpoints
                         if (!n_before_user_known && !near_prompt_end) {
                             do_checkpoint = false;
                         }
+
+                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
+
+                        // note: prefix block registration moved to after llama_decode() so KV cache
+                        // cells are actually populated when seq_cp runs
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -3424,6 +3698,92 @@ private:
 
                         slot.copy_state_to(*child);
                         child->state = SLOT_STATE_DONE_PROMPT;
+                    }
+                }
+            }
+
+            // register prefix blocks AFTER decode so KV cells are populated
+            if (prefix_cache.enabled) {
+                for (auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+                        continue;
+                    }
+                    if (slot.i_batch < (int) i || slot.i_batch >= (int) (i + n_tokens)) {
+                        continue;
+                    }
+                    if (!slot.task) {
+                        continue;
+                    }
+
+                    const auto & input_tokens = slot.task->tokens;
+                    const int bs = prefix_cache.block_size;
+                    const int n_tok = slot.prompt.n_tokens();
+                    const int n_complete_blocks = n_tok / bs;
+                    // figure out how many blocks were complete BEFORE this batch
+                    const int n_tok_prev = n_tok - (slot.i_batch >= (int) i ? (int)(std::min((int)(i + n_tokens), slot.i_batch + 1) - i) : 0);
+                    // simpler: just use the previous prompt size tracked in the slot
+                    // Actually, use the batch token count for this slot
+                    const int n_prev_blocks = (int)slot.n_prompt_tokens_processed > n_tok ?
+                        0 : (n_tok - (int)(slot.i_batch - i + 1)) / bs;
+
+                    // even simpler: just register any block that isn't registered yet
+                    for (int b = 0; b < n_complete_blocks; b++) {
+                        const llama_pos pos_start = (llama_pos)(b * bs);
+                        if ((int)(pos_start + bs) > n_tok) {
+                            break;
+                        }
+                        const llama_token * block_tokens = &input_tokens[b * bs];
+                        uint64_t h = prefix_cache.compute_hash(block_tokens, bs, pos_start);
+                        if (prefix_cache.blocks.count(h)) {
+                            continue; // already registered
+                        }
+
+                        if (prefix_cache.num_blocks() >= prefix_cache.max_blocks) {
+                            auto evicted = prefix_cache.evict_lru(1);
+                            for (const auto & e : evicted) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_tgt), e.template_seq, -1, -1);
+                            }
+                            if (evicted.empty()) {
+                                break;
+                            }
+                        }
+                        llama_seq_id tseq = prefix_cache.alloc_template_seq();
+                        if (tseq < 0) {
+                            break;
+                        }
+
+                        llama_memory_t rmem = llama_get_memory(ctx_tgt);
+                        llama_memory_seq_cp(rmem, slot.id, tseq, pos_start, pos_start + bs);
+
+                        // debug: verify template positions
+                        llama_pos t_min = llama_memory_seq_pos_min(rmem, tseq);
+                        llama_pos t_max = llama_memory_seq_pos_max(rmem, tseq);
+                        SLT_INF(slot, "registered prefix block %d at pos %d (template seq %d) template[%d,%d]\n",
+                                b, (int)pos_start, tseq, (int)t_min, (int)t_max);
+
+                        prefix_cache.register_block(block_tokens, bs, pos_start, tseq);
+                    }
+
+                    // save RS checkpoint at block boundary
+                    if (n_complete_blocks > 0 && (n_tok % bs) == 0) {
+                        const int b = n_complete_blocks - 1;
+                        const llama_pos pos_start = (llama_pos)(b * bs);
+                        const llama_token * block_tokens = &input_tokens[b * bs];
+                        uint64_t h = prefix_cache.compute_hash(block_tokens, bs, pos_start);
+                        auto it = prefix_cache.blocks.find(h);
+                        if (it != prefix_cache.blocks.end() && it->second.rs_data.empty()) {
+                            const size_t rs_sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            if (rs_sz > 0) {
+                                std::vector<uint8_t> rs_data(rs_sz);
+                                const size_t written = llama_state_seq_get_data_ext(ctx_tgt, rs_data.data(), rs_sz, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                if (written > 0) {
+                                    rs_data.resize(written);
+                                    prefix_cache.store_rs_checkpoint(&it->second, rs_data);
+                                    SLT_INF(slot, "saved RS checkpoint at block %d end (pos %d, %zu bytes)\n",
+                                            b, (int)(pos_start + bs), written);
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -548,6 +548,10 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+    // prefix block cache (requires --kv-unified)
+    int32_t prefix_cache_blocks = 0;    // max blocks to cache (0 = disabled)
+    int32_t prefix_block_size   = 4096; // tokens per block (larger = more coverage, coarser granularity)
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
