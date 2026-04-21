@@ -431,7 +431,9 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_TQ3_0   = 42, // TurboQuant 3-bit (WHT rotation + Lloyd-Max codebook)
         GGML_TYPE_TQ4_0   = 43, // TurboQuant 4-bit (WHT rotation + Lloyd-Max 16-level codebook)
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_ISO3_0  = 44, // IsoQuant-Fast 3-bit (quaternion rotation + Lloyd-Max codebook)
+        GGML_TYPE_ISO4_0  = 45, // IsoQuant-Fast 4-bit (quaternion rotation + Lloyd-Max 16-level codebook)
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision

@@ -389,6 +389,134 @@ static __device__ void cpy_blck_f32_tq2_0(const char * cxi, char * cdsti) {
     quantize_f32_tq2_0_block((const float *)cxi, (block_tq2_0 *)cdsti);
 }
 
+// IsoQuant-Fast quaternion constants (device)
+__device__ static const float ISO_QUAT_L_D[8][4] = {
+    {+0.28654116f, -0.07976099f, +0.37363426f, +0.87859535f},
+    {-0.13104903f, -0.13103984f, +0.88384080f, +0.42951154f},
+    {-0.48257617f, +0.55770145f, -0.47635045f, -0.47872704f},
+    {+0.09138335f, -0.72260011f, -0.65146014f, -0.21236253f},
+    {-0.51001832f, +0.15824148f, -0.45724199f, -0.71117558f},
+    {+0.71232240f, -0.10972992f, +0.03281950f, -0.69244424f},
+    {-0.40865341f, +0.08326659f, -0.86401979f, +0.28202636f},
+    {-0.29173593f, -0.14167843f, -0.29225463f, +0.89966916f},
+};
+
+// IsoQuant-Fast Lloyd-Max 3-bit boundaries and centroids (device)
+__device__ static const float ISO3_0_BOUNDARIES_D[7] = {
+    -1.3990f, -0.7753f, -0.2503f, 0.0f, 0.2503f, 0.7753f, 1.3990f
+};
+__device__ static const float ISO3_0_CENTROIDS_D[8] = {
+    -1.7479f, -1.0500f, -0.5006f, -0.0000f,
+     0.0000f,  0.5006f,  1.0500f,  1.7479f,
+};
+
+// IsoQuant-Fast Lloyd-Max 4-bit boundaries and centroids (device)
+__device__ static const float ISO4_0_BOUNDARIES_D[15] = {
+    -2.4013f, -1.8441f, -1.4377f, -1.0998f, -0.8000f, -0.5227f, -0.2584f, 0.0f,
+     0.2584f,  0.5227f,  0.8000f,  1.0998f,  1.4377f,  1.8441f,  2.4013f,
+};
+__device__ static const float ISO4_0_CENTROIDS_D[16] = {
+    -2.7331f, -2.0696f, -1.6186f, -1.2568f, -0.9428f, -0.6571f, -0.3883f, -0.1285f,
+     0.1285f,  0.3883f,  0.6571f,  0.9428f,  1.2568f,  1.6186f,  2.0696f,  2.7331f,
+};
+
+// Device quaternion multiply: out = a * b (Hamilton product)
+__device__ static inline void iso_quat_mul_d(const float a[4], const float b[4], float out[4]) {
+    out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
+    out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
+    out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
+    out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
+}
+
+// Device quaternion conjugate multiply: out = conj(a) * b
+__device__ static inline void iso_quat_conj_mul_d(const float a[4], const float b[4], float out[4]) {
+    out[0] =  a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+    out[1] =  a[0]*b[1] - a[1]*b[0] - a[2]*b[3] + a[3]*b[2];
+    out[2] =  a[0]*b[2] + a[1]*b[3] - a[2]*b[0] - a[3]*b[1];
+    out[3] =  a[0]*b[3] - a[1]*b[2] + a[2]*b[1] - a[3]*b[0];
+}
+
+static __device__ void quantize_f32_iso3_0_block(const float * __restrict__ x, block_iso3_0 * __restrict__ y) {
+    float buf[QK_ISO3_0];
+
+    // 1. Compute RMS scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_ISO3_0; j++) {
+        sum_sq += x[j] * x[j];
+    }
+    float d = sqrtf(sum_sq / QK_ISO3_0);
+    y->d = __float2half(d);
+    if (d < 1e-10f) d = 1e-10f;
+    float id = 1.0f / d;
+
+    // 2. Normalize and apply quaternion rotation per 4D group
+    for (int g = 0; g < QK_ISO3_0 / 4; g++) {
+        float v[4], r[4];
+        for (int c = 0; c < 4; c++) v[c] = x[g*4 + c] * id;
+        iso_quat_mul_d(ISO_QUAT_L_D[g], v, r);
+        for (int c = 0; c < 4; c++) buf[g*4 + c] = r[c];
+    }
+
+    // 3. Scalar quantize (3-bit) and pack
+    uint8_t idx[QK_ISO3_0];
+    for (int j = 0; j < QK_ISO3_0; j++) {
+        float val = buf[j];
+        int q = 0;
+        for (int b = 0; b < 7; b++) {
+            if (val > ISO3_0_BOUNDARIES_D[b]) q = b + 1;
+        }
+        idx[j] = (uint8_t)q;
+    }
+
+    for (int j = 0; j < QK_ISO3_0 / 8; j++) {
+        uint8_t *qp = &y->qs[j * 3];
+        qp[0] = idx[8*j] | (idx[8*j+1] << 3) | (idx[8*j+2] << 6);
+        qp[1] = (idx[8*j+2] >> 2) | (idx[8*j+3] << 1) | (idx[8*j+4] << 4) | (idx[8*j+5] << 7);
+        qp[2] = (idx[8*j+5] >> 1) | (idx[8*j+6] << 2) | (idx[8*j+7] << 5);
+    }
+}
+
+static __device__ void quantize_f32_iso4_0_block(const float * __restrict__ x, block_iso4_0 * __restrict__ y) {
+    float buf[QK_ISO4_0];
+
+    // 1. Compute RMS scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_ISO4_0; j++) {
+        sum_sq += x[j] * x[j];
+    }
+    float d = sqrtf(sum_sq / QK_ISO4_0);
+    y->d = __float2half(d);
+    if (d < 1e-10f) d = 1e-10f;
+    float id = 1.0f / d;
+
+    // 2. Normalize and apply quaternion rotation per 4D group
+    for (int g = 0; g < QK_ISO4_0 / 4; g++) {
+        float v[4], r[4];
+        for (int c = 0; c < 4; c++) v[c] = x[g*4 + c] * id;
+        iso_quat_mul_d(ISO_QUAT_L_D[g], v, r);
+        for (int c = 0; c < 4; c++) buf[g*4 + c] = r[c];
+    }
+
+    // 3. Scalar quantize (4-bit) and pack
+    for (int j = 0; j < QK_ISO4_0 / 2; j++) {
+        float v0 = buf[2*j], v1 = buf[2*j + 1];
+        int q0 = 0, q1 = 0;
+        for (int b = 0; b < 15; b++) {
+            if (v0 > ISO4_0_BOUNDARIES_D[b]) q0 = b + 1;
+            if (v1 > ISO4_0_BOUNDARIES_D[b]) q1 = b + 1;
+        }
+        y->qs[j] = (uint8_t)(q0 | (q1 << 4));
+    }
+}
+
+static __device__ void cpy_blck_f32_iso3_0(const char * cxi, char * cdsti) {
+    quantize_f32_iso3_0_block((const float *)cxi, (block_iso3_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_iso4_0(const char * cxi, char * cdsti) {
+    quantize_f32_iso4_0_block((const float *)cxi, (block_iso4_0 *)cdsti);
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

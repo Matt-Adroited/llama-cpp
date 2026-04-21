@@ -84,7 +84,10 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-tq3_0-tq3_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-tq4_0-tq4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-tq4_0-tq2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-tq3_0-tq2_0.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-tq3_0-tq2_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-iso3_0-iso3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-iso4_0-iso4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-iso3_0-iso4_0.cu)
 endif()
 
 ggml_add_backend_library(ggml-hip

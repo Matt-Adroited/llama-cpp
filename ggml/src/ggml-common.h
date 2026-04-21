@@ -300,6 +300,25 @@ typedef struct {
 } block_tq4_0;
 static_assert(sizeof(block_tq4_0) == sizeof(ggml_half) + QK_TQ4_0 / 2, "wrong tq4_0 block size/padding");
 
+// IsoQuant-Fast 3-bit (3.5 bpw)
+// 32 values per block, quaternion rotation + Lloyd-Max 8-level codebook
+// Uses per-4D-block quaternion rotation instead of WHT — divides any head dim
+#define QK_ISO3_0 32
+typedef struct {
+    ggml_half d;                    // scale factor (RMS of block)
+    uint8_t qs[QK_ISO3_0 * 3 / 8]; // 3-bit quant indices, packed (12 bytes)
+} block_iso3_0;
+static_assert(sizeof(block_iso3_0) == sizeof(ggml_half) + QK_ISO3_0 * 3 / 8, "wrong iso3_0 block size/padding");
+
+// IsoQuant-Fast 4-bit (4.5 bpw)
+// 32 values per block, quaternion rotation + Lloyd-Max 16-level codebook
+#define QK_ISO4_0 32
+typedef struct {
+    ggml_half d;                    // scale factor (RMS of block)
+    uint8_t qs[QK_ISO4_0 / 2];     // 4-bit quant indices, packed (16 bytes)
+} block_iso4_0;
+static_assert(sizeof(block_iso4_0) == sizeof(ggml_half) + QK_ISO4_0 / 2, "wrong iso4_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

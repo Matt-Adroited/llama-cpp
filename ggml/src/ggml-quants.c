@@ -2733,6 +2733,233 @@ size_t quantize_tq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+// ====================== IsoQuant-Fast (quaternion rotation + Lloyd-Max) ======================
+
+// IsoQuant-Fast random unit quaternions (seed=42, 8 groups for block_size=32)
+// Each quaternion: [w, x, y, z] as unit quaternion on S^3
+static const float ISO_QUAT_L[8][4] = {
+    {+0.28654116f, -0.07976099f, +0.37363426f, +0.87859535f},
+    {-0.13104903f, -0.13103984f, +0.88384080f, +0.42951154f},
+    {-0.48257617f, +0.55770145f, -0.47635045f, -0.47872704f},
+    {+0.09138335f, -0.72260011f, -0.65146014f, -0.21236253f},
+    {-0.51001832f, +0.15824148f, -0.45724199f, -0.71117558f},
+    {+0.71232240f, -0.10972992f, +0.03281950f, -0.69244424f},
+    {-0.40865341f, +0.08326659f, -0.86401979f, +0.28202636f},
+    {-0.29173593f, -0.14167843f, -0.29225463f, +0.89966916f},
+};
+
+// Lloyd-Max 3-bit boundaries (same as TQ3_0 — both use N(0,1) 8-level)
+static const float ISO3_0_BOUNDARIES[7] = {
+    -1.3990f, -0.7753f, -0.2503f, 0.0f, 0.2503f, 0.7753f, 1.3990f
+};
+static const float ISO3_0_CENTROIDS[8] = {
+    -1.7479f, -1.0500f, -0.5006f, -0.0000f,
+     0.0000f,  0.5006f,  1.0500f,  1.7479f,
+};
+
+// Lloyd-Max 4-bit boundaries (same as TQ4_0 — 16-level N(0,1))
+static const float ISO4_0_BOUNDARIES[15] = {
+    -2.4013f, -1.8441f, -1.4377f, -1.0998f, -0.8000f, -0.5227f, -0.2584f, 0.0f,
+     0.2584f,  0.5227f,  0.8000f,  1.0998f,  1.4377f,  1.8441f,  2.4013f,
+};
+static const float ISO4_0_CENTROIDS[16] = {
+    -2.7331f, -2.0696f, -1.6186f, -1.2568f, -0.9428f, -0.6571f, -0.3883f, -0.1285f,
+     0.1285f,  0.3883f,  0.6571f,  0.9428f,  1.2568f,  1.6186f,  2.0696f,  2.7331f,
+};
+
+// Quaternion Hamilton product: out = a * b
+// a, b, out are [w, x, y, z]
+static inline void iso_quat_mul(const float a[4], const float b[4], float out[4]) {
+    out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
+    out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
+    out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
+    out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
+}
+
+// Quaternion conjugate multiply: out = conj(a) * b
+static inline void iso_quat_conj_mul(const float a[4], const float b[4], float out[4]) {
+    // conjugate(a) = [w, -x, -y, -z]
+    out[0] =  a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+    out[1] =  a[0]*b[1] - a[1]*b[0] - a[2]*b[3] + a[3]*b[2];
+    out[2] =  a[0]*b[2] + a[1]*b[3] - a[2]*b[0] - a[3]*b[1];
+    out[3] =  a[0]*b[3] - a[1]*b[2] + a[2]*b[1] - a[3]*b[0];
+}
+
+void quantize_row_iso3_0_ref(const float * GGML_RESTRICT x, block_iso3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ISO3_0 == 0);
+    const int64_t nb = k / QK_ISO3_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        // 1. Compute RMS scale
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_ISO3_0; j++) {
+            sum_sq += x[i * QK_ISO3_0 + j] * x[i * QK_ISO3_0 + j];
+        }
+        float d = sqrtf(sum_sq / QK_ISO3_0);
+        y[i].d = GGML_FP32_TO_FP16(d);
+        if (d < 1e-10f) d = 1e-10f;
+        float id = 1.0f / d;
+
+        // 2. Normalize and apply quaternion rotation per 4D group
+        float rotated[QK_ISO3_0];
+        for (int g = 0; g < QK_ISO3_0 / 4; g++) {
+            float v[4];
+            for (int c = 0; c < 4; c++) {
+                v[c] = x[i * QK_ISO3_0 + g * 4 + c] * id;
+            }
+            float r[4];
+            iso_quat_mul(ISO_QUAT_L[g], v, r);
+            for (int c = 0; c < 4; c++) {
+                rotated[g * 4 + c] = r[c];
+            }
+        }
+
+        // 3. Scalar quantize to 3-bit (8 levels) using Lloyd-Max boundaries
+        uint8_t idx[QK_ISO3_0];
+        for (int j = 0; j < QK_ISO3_0; j++) {
+            float val = rotated[j];
+            int q = 0;
+            for (int b = 0; b < 7; b++) {
+                if (val > ISO3_0_BOUNDARIES[b]) q = b + 1;
+            }
+            idx[j] = (uint8_t)q;
+        }
+
+        // 4. Pack 3-bit indices: 8 indices → 3 bytes
+        for (int j = 0; j < QK_ISO3_0 / 8; j++) {
+            uint8_t *qp = &y[i].qs[j * 3];
+            qp[0] = idx[8*j] | (idx[8*j+1] << 3) | (idx[8*j+2] << 6);
+            qp[1] = (idx[8*j+2] >> 2) | (idx[8*j+3] << 1) | (idx[8*j+4] << 4) | (idx[8*j+5] << 7);
+            qp[2] = (idx[8*j+5] >> 1) | (idx[8*j+6] << 2) | (idx[8*j+7] << 5);
+        }
+    }
+}
+
+void dequantize_row_iso3_0(const block_iso3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ISO3_0 == 0);
+    const int64_t nb = k / QK_ISO3_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // 1. Unpack 3-bit indices and look up centroids
+        float rotated[QK_ISO3_0];
+        for (int j = 0; j < QK_ISO3_0 / 8; j++) {
+            const uint8_t *qp = &x[i].qs[j * 3];
+            uint8_t idx[8];
+            idx[0] = qp[0] & 0x7;
+            idx[1] = (qp[0] >> 3) & 0x7;
+            idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 0x7;
+            idx[3] = (qp[1] >> 1) & 0x7;
+            idx[4] = (qp[1] >> 4) & 0x7;
+            idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 0x7;
+            idx[6] = (qp[2] >> 2) & 0x7;
+            idx[7] = (qp[2] >> 5) & 0x7;
+            for (int c = 0; c < 8; c++) {
+                rotated[8*j + c] = ISO3_0_CENTROIDS[idx[c]];
+            }
+        }
+
+        // 2. Apply inverse quaternion rotation per 4D group
+        for (int g = 0; g < QK_ISO3_0 / 4; g++) {
+            float v[4], r[4];
+            for (int c = 0; c < 4; c++) {
+                v[c] = rotated[g * 4 + c];
+            }
+            iso_quat_conj_mul(ISO_QUAT_L[g], v, r);
+            for (int c = 0; c < 4; c++) {
+                y[i * QK_ISO3_0 + g * 4 + c] = r[c] * d;
+            }
+        }
+    }
+}
+
+size_t quantize_iso3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_ISO3_0, n_per_row);
+    quantize_row_iso3_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+void quantize_row_iso4_0_ref(const float * GGML_RESTRICT x, block_iso4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ISO4_0 == 0);
+    const int64_t nb = k / QK_ISO4_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        // 1. Compute RMS scale
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_ISO4_0; j++) {
+            sum_sq += x[i * QK_ISO4_0 + j] * x[i * QK_ISO4_0 + j];
+        }
+        float d = sqrtf(sum_sq / QK_ISO4_0);
+        y[i].d = GGML_FP32_TO_FP16(d);
+        if (d < 1e-10f) d = 1e-10f;
+        float id = 1.0f / d;
+
+        // 2. Normalize and apply quaternion rotation per 4D group
+        float rotated[QK_ISO4_0];
+        for (int g = 0; g < QK_ISO4_0 / 4; g++) {
+            float v[4];
+            for (int c = 0; c < 4; c++) {
+                v[c] = x[i * QK_ISO4_0 + g * 4 + c] * id;
+            }
+            float r[4];
+            iso_quat_mul(ISO_QUAT_L[g], v, r);
+            for (int c = 0; c < 4; c++) {
+                rotated[g * 4 + c] = r[c];
+            }
+        }
+
+        // 3. Scalar quantize to 4-bit (16 levels) using Lloyd-Max boundaries
+        // 4. Pack 4-bit indices: 2 per byte
+        for (int j = 0; j < QK_ISO4_0 / 2; j++) {
+            float v0 = rotated[2*j], v1 = rotated[2*j + 1];
+            int q0 = 0, q1 = 0;
+            for (int b = 0; b < 15; b++) {
+                if (v0 > ISO4_0_BOUNDARIES[b]) q0 = b + 1;
+                if (v1 > ISO4_0_BOUNDARIES[b]) q1 = b + 1;
+            }
+            y[i].qs[j] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
+void dequantize_row_iso4_0(const block_iso4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ISO4_0 == 0);
+    const int64_t nb = k / QK_ISO4_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // 1. Unpack 4-bit indices and look up centroids
+        float rotated[QK_ISO4_0];
+        for (int j = 0; j < QK_ISO4_0 / 2; j++) {
+            uint8_t packed = x[i].qs[j];
+            rotated[2*j]     = ISO4_0_CENTROIDS[packed & 0xF];
+            rotated[2*j + 1] = ISO4_0_CENTROIDS[packed >> 4];
+        }
+
+        // 2. Apply inverse quaternion rotation per 4D group
+        for (int g = 0; g < QK_ISO4_0 / 4; g++) {
+            float v[4], r[4];
+            for (int c = 0; c < 4; c++) {
+                v[c] = rotated[g * 4 + c];
+            }
+            iso_quat_conj_mul(ISO_QUAT_L[g], v, r);
+            for (int c = 0; c < 4; c++) {
+                y[i * QK_ISO4_0 + g * 4 + c] = r[c] * d;
+            }
+        }
+    }
+}
+
+size_t quantize_iso4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_ISO4_0, n_per_row);
+    quantize_row_iso4_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

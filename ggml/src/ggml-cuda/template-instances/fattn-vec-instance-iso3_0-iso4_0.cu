@@ -1,0 +1,7 @@
+// IsoQuant-Fast mixed K=iso3_0 V=iso4_0 flash attention template instances
+
+#include "../fattn-vec.cuh"
+
+DECL_FATTN_VEC_CASE( 64, GGML_TYPE_ISO3_0, GGML_TYPE_ISO4_0);
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_ISO3_0, GGML_TYPE_ISO4_0);
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_ISO3_0, GGML_TYPE_ISO4_0);

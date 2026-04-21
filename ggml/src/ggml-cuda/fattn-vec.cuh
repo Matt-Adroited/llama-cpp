@@ -124,6 +124,11 @@ static __global__ void flash_attn_ext_vec(
     constexpr bool is_tq_K = (type_K == GGML_TYPE_TQ2_0 || type_K == GGML_TYPE_TQ3_0 || type_K == GGML_TYPE_TQ4_0);
     constexpr bool is_tq_V = (type_V == GGML_TYPE_TQ2_0 || type_V == GGML_TYPE_TQ3_0 || type_V == GGML_TYPE_TQ4_0);
     constexpr bool is_tq = is_tq_K || is_tq_V;
+    constexpr bool is_iso_K = (type_K == GGML_TYPE_ISO3_0 || type_K == GGML_TYPE_ISO4_0);
+    constexpr bool is_iso_V = (type_V == GGML_TYPE_ISO3_0 || type_V == GGML_TYPE_ISO4_0);
+    constexpr bool is_iso = is_iso_K || is_iso_V;
+    // Rotated types need shared buffer for Q pre-rotation and V post-rotation
+    constexpr bool needs_rot_buf = is_tq || is_iso;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
@@ -131,8 +136,8 @@ static __global__ void flash_attn_ext_vec(
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
-    // For TQ types: dedicated shared buffer for Q-side WHT rotation
-    __shared__ float Q_tq_buf[is_tq ? ncols * D : 1];
+    // For TQ/ISO types: dedicated shared buffer for Q-side rotation and V-side inverse rotation
+    __shared__ float Q_tq_buf[needs_rot_buf ? ncols * D : 1];
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -241,8 +246,92 @@ static __global__ void flash_attn_ext_vec(
             }
 
             __syncthreads();
+        } else if constexpr (is_iso_K) {
+            // ISO optimized path: load Q as float, apply forward quaternion rotation, then quantize to q8_1
+            constexpr int iso_blk_size = (type_K == GGML_TYPE_ISO3_0) ? QK_ISO3_0 : QK_ISO4_0;
+#pragma unroll
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+                if (j0 + nwarps > ncols && j >= ncols) {
+                    break;
+                }
+
+                int    * tmp_q_i32 = (int    *) &KQ[j*D];
+                float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
+
+                if (ncols > 1 && ic0 + j >= int(ne01.z)) {
+#pragma unroll
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
+                        const int i = i0 + threadIdx.x;
+                        if (i0 + WARP_SIZE <= int(D/sizeof(int)) || i < int(D/sizeof(int))) {
+                            tmp_q_i32[i] = 0;
+                        }
+                    }
+                    if (threadIdx.x < D/QK8_1) {
+                        tmp_q_ds[threadIdx.x] = make_float2(0.0f, 0.0f);
+                    }
+                } else {
+                    // Load Q as float into dedicated shared buffer
+                    const float * Q_f = (const float *) (Q + j*nb01);
+                    float * Q_buf = Q_tq_buf + j * D;
+                    for (int i = threadIdx.x; i < D; i += WARP_SIZE) {
+                        Q_buf[i] = Q_f[i];
+                    }
+                }
+            }
+
+            __syncthreads();
+
+            // Apply forward quaternion rotation per 4D group per ISO block (single thread per column)
+#pragma unroll
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+                if (j < ncols && threadIdx.x == 0 && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                    float * Q_buf = Q_tq_buf + j * D;
+                    for (int b = 0; b < D / iso_blk_size; b++) {
+                        float * blk_ptr = Q_buf + b * iso_blk_size;
+                        // Forward quaternion rotation per 4D group
+                        for (int g = 0; g < iso_blk_size / 4; g++) {
+                            float v[4], r[4];
+                            for (int c = 0; c < 4; c++) v[c] = blk_ptr[g*4 + c];
+                            // q_L * v (Hamilton product)
+                            const float * q = ISO_QUAT_L_FA[g];
+                            r[0] = q[0]*v[0] - q[1]*v[1] - q[2]*v[2] - q[3]*v[3];
+                            r[1] = q[0]*v[1] + q[1]*v[0] + q[2]*v[3] - q[3]*v[2];
+                            r[2] = q[0]*v[2] - q[1]*v[3] + q[2]*v[0] + q[3]*v[1];
+                            r[3] = q[0]*v[3] + q[1]*v[2] - q[2]*v[1] + q[3]*v[0];
+                            for (int c = 0; c < 4; c++) blk_ptr[g*4 + c] = r[c];
+                        }
+                    }
+                }
+            }
+
+            __syncthreads();
+
+            // Quantize rotated Q to q8_1
+#pragma unroll
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+                if (j0 + nwarps > ncols && j >= ncols) {
+                    break;
+                }
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    float * Q_buf = Q_tq_buf + j * D;
+                    int    * tmp_q_i32 = (int    *) &KQ[j*D];
+                    float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
+
+                    constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+#pragma unroll
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+                        quantize_q8_1_to_shared<float2, nthreads_quantize>
+                            (Q_buf + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    }
+                }
+            }
+
+            __syncthreads();
         } else {
-            // Standard (non-TQ) path
+            // Standard (non-TQ/ISO) path
 #pragma unroll
             for (int j0 = 0; j0 < ncols; j0 += nwarps) {
                 const int j = j0 + threadIdx.y;
@@ -639,8 +728,58 @@ static __global__ void flash_attn_ext_vec(
                     }
                     dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
                 }
+            } else if constexpr (is_iso_V) {
+                // ISO V optimization: VKQ was accumulated in rotated space (raw centroids * scale).
+                // Now apply inverse quaternion rotation per 4D group to get back to original space.
+                constexpr int iso_blk_size = (type_V == GGML_TYPE_ISO3_0) ? QK_ISO3_0 : QK_ISO4_0;
+
+                // Sum across warps into Q_tq_buf (reuse the shared float buffer)
+#pragma unroll
+                for (int i0 = 0; i0 < D; i0 += nthreads) {
+                    float dst_val = 0;
+#pragma unroll
+                    for (int w = 0; w < nwarps; ++w) {
+#pragma unroll
+                        for (int v = 0; v < V_cols_per_iter; ++v) {
+                            dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
+                        }
+                    }
+                    Q_tq_buf[i0 + tid] = dst_val;
+                }
+
+                __syncthreads();
+
+                // Apply inverse quaternion rotation per 4D group per ISO block (single thread)
+                if (threadIdx.x == 0 && threadIdx.y == 0) {
+                    for (int b = 0; b < D / iso_blk_size; b++) {
+                        float * blk_ptr = Q_tq_buf + b * iso_blk_size;
+                        for (int g = 0; g < iso_blk_size / 4; g++) {
+                            float v[4], r[4];
+                            for (int c = 0; c < 4; c++) v[c] = blk_ptr[g*4 + c];
+                            // conj(q_L) * v
+                            const float * q = ISO_QUAT_L_FA[g];
+                            r[0] =  q[0]*v[0] + q[1]*v[1] + q[2]*v[2] + q[3]*v[3];
+                            r[1] =  q[0]*v[1] - q[1]*v[0] - q[2]*v[3] + q[3]*v[2];
+                            r[2] =  q[0]*v[2] + q[1]*v[3] - q[2]*v[0] - q[3]*v[1];
+                            r[3] =  q[0]*v[3] - q[1]*v[2] + q[2]*v[1] - q[3]*v[0];
+                            for (int c = 0; c < 4; c++) blk_ptr[g*4 + c] = r[c];
+                        }
+                    }
+                }
+
+                __syncthreads();
+
+                // Write to dst
+#pragma unroll
+                for (int i0 = 0; i0 < D; i0 += nthreads) {
+                    float dst_val = Q_tq_buf[i0 + tid];
+                    if (gridDim.y == 1) {
+                        dst_val /= KQ_sum[j_VKQ];
+                    }
+                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+                }
             } else {
-                // Original path for non-TQ types
+                // Original path for non-TQ/ISO types
 #pragma unroll
                 for (int i0 = 0; i0 < D; i0 += nthreads) {
                     float dst_val = 0;
@@ -743,6 +882,8 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_TQ2_0); \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_TQ3_0); \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_TQ4_0); \
+    extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_ISO3_0); \
+    extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_ISO4_0); \
 
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_F16)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q4_0)
@@ -754,6 +895,8 @@ EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_BF16)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_TQ2_0)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_TQ3_0)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_TQ4_0)
+EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_ISO3_0)
+EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_ISO4_0)
 
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_F16)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_Q4_0)
@@ -765,6 +908,8 @@ EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_BF16)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_TQ2_0)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_TQ3_0)
 EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_TQ4_0)
+EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_ISO3_0)
+EXTERN_DECL_FATTN_VEC_CASES(128, GGML_TYPE_ISO4_0)
 
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_F16)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q4_0)
@@ -776,3 +921,5 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_TQ2_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_TQ3_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_TQ4_0)
+EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_ISO3_0)
+EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_ISO4_0)
