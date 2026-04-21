@@ -991,6 +991,281 @@ static __device__ __forceinline__ void dequantize_V_tq4_0(const void * __restric
     }
 }
 
+// IsoQuant-Fast constants for flash attention
+// Quaternion constants (same as cpy-utils.cuh)
+__device__ static const float ISO_QUAT_L_FA[8][4] = {
+    {+0.28654116f, -0.07976099f, +0.37363426f, +0.87859535f},
+    {-0.13104903f, -0.13103984f, +0.88384080f, +0.42951154f},
+    {-0.48257617f, +0.55770145f, -0.47635045f, -0.47872704f},
+    {+0.09138335f, -0.72260011f, -0.65146014f, -0.21236253f},
+    {-0.51001832f, +0.15824148f, -0.45724199f, -0.71117558f},
+    {+0.71232240f, -0.10972992f, +0.03281950f, -0.69244424f},
+    {-0.40865341f, +0.08326659f, -0.86401979f, +0.28202636f},
+    {-0.29173593f, -0.14167843f, -0.29225463f, +0.89966916f},
+};
+
+__device__ static const float ISO3_0_CENTROIDS_FA[8] = {
+    -1.7479f, -1.0500f, -0.5006f, -0.0000f,
+     0.0000f,  0.5006f,  1.0500f,  1.7479f,
+};
+
+__device__ static const float ISO4_0_CENTROIDS_FA[16] = {
+    -2.7331f, -2.0696f, -1.6186f, -1.2568f, -0.9428f, -0.6571f, -0.3883f, -0.1285f,
+     0.1285f,  0.3883f,  0.6571f,  0.9428f,  1.2568f,  1.6186f,  2.0696f,  2.7331f
+};
+
+// Inverse quaternion rotation: out = conj(a) * b
+__device__ static inline void iso_quat_conj_mul_fa(const float a[4], const float b[4], float out[4]) {
+    out[0] =  a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+    out[1] =  a[0]*b[1] - a[1]*b[0] - a[2]*b[3] + a[3]*b[2];
+    out[2] =  a[0]*b[2] + a[1]*b[3] - a[2]*b[0] - a[3]*b[1];
+    out[3] =  a[0]*b[3] - a[1]*b[2] + a[2]*b[1] - a[3]*b[0];
+}
+
+// Unpack 3-bit indices from packed bytes (8 indices from 3 bytes)
+__device__ static inline void iso3_0_unpack8(const uint8_t * qp, uint8_t idx[8]) {
+    idx[0] =  qp[0]       & 0x7;
+    idx[1] = (qp[0] >> 3) & 0x7;
+    idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 0x7;
+    idx[3] = (qp[1] >> 1) & 0x7;
+    idx[4] = (qp[1] >> 4) & 0x7;
+    idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 0x7;
+    idx[6] = (qp[2] >> 2) & 0x7;
+    idx[7] = (qp[2] >> 5) & 0x7;
+}
+
+// Dequantize a full iso3_0 block: unpack → centroid → inverse quat rotate → scale
+static __device__ __forceinline__ void dequantize_iso3_0_block(const block_iso3_0 * __restrict__ blk, float * __restrict__ out) {
+    const float d = __half2float(blk->d);
+
+    // Unpack 3-bit indices and look up centroids
+    float cent[QK_ISO3_0];
+    for (int g = 0; g < QK_ISO3_0 / 8; g++) {
+        uint8_t idx[8];
+        iso3_0_unpack8(&blk->qs[g * 3], idx);
+        for (int j = 0; j < 8; j++) {
+            cent[g * 8 + j] = ISO3_0_CENTROIDS_FA[idx[j]];
+        }
+    }
+
+    // Inverse quaternion rotation per 4D group
+    for (int g = 0; g < QK_ISO3_0 / 4; g++) {
+        float r[4];
+        iso_quat_conj_mul_fa(ISO_QUAT_L_FA[g], &cent[g * 4], r);
+        for (int c = 0; c < 4; c++) {
+            out[g * 4 + c] = r[c] * d;
+        }
+    }
+}
+
+// Dequantize a full iso4_0 block: unpack → centroid → inverse quat rotate → scale
+static __device__ __forceinline__ void dequantize_iso4_0_block(const block_iso4_0 * __restrict__ blk, float * __restrict__ out) {
+    const float d = __half2float(blk->d);
+
+    // Unpack 4-bit indices and look up centroids
+    float cent[QK_ISO4_0];
+    for (int j = 0; j < QK_ISO4_0 / 2; j++) {
+        uint8_t packed = blk->qs[j];
+        cent[2 * j]     = ISO4_0_CENTROIDS_FA[packed & 0xF];
+        cent[2 * j + 1] = ISO4_0_CENTROIDS_FA[packed >> 4];
+    }
+
+    // Inverse quaternion rotation per 4D group
+    for (int g = 0; g < QK_ISO4_0 / 4; g++) {
+        float r[4];
+        iso_quat_conj_mul_fa(ISO_QUAT_L_FA[g], &cent[g * 4], r);
+        for (int c = 0; c < 4; c++) {
+            out[g * 4 + c] = r[c] * d;
+        }
+    }
+}
+
+// Flash attention K dot product for iso3_0
+// NOTE: Q is pre-rotated (forward quat) in fattn-vec.cuh, so K just uses raw centroids * scale
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iso3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_iso3_0 * K_iso = (const block_iso3_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+    constexpr int n_blocks = D / QK_ISO3_0;
+    constexpr int qi_per_block = QK_ISO3_0 / (int)sizeof(int);
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        // Unpack 3-bit indices → centroid lookup (no inverse rotation, Q was pre-rotated)
+        float cent[QK_ISO3_0];
+        for (int g = 0; g < QK_ISO3_0 / 8; g++) {
+            uint8_t idx[8];
+            iso3_0_unpack8(&K_iso[blk].qs[g * 3], idx);
+            for (int j = 0; j < 8; j++) {
+                cent[g * 8 + j] = ISO3_0_CENTROIDS_FA[idx[j]];
+            }
+        }
+
+        const float k_scale = __half2float(K_iso[blk].d);
+
+#pragma unroll
+        for (int k_local_0 = 0; k_local_0 < qi_per_block; k_local_0 += nthreads) {
+            const int k_local = k_local_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            const int elem_start = k_local * 4;
+            const int q_reg_idx = (blk * qi_per_block + k_local_0) / nthreads;
+
+            const int u = Q_q8[q_reg_idx];
+            const int8_t * q8 = (const int8_t *)&u;
+            const float2 Q_ds = ((const float2 *) Q_ds_v)[q_reg_idx];
+
+            float block_sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                block_sum += cent[elem_start + j] * (float)q8[j];
+            }
+
+            sum += block_sum * Q_ds.x * k_scale;
+        }
+    }
+
+    return sum;
+}
+
+// Flash attention K dot product for iso4_0
+// NOTE: Q is pre-rotated (forward quat) in fattn-vec.cuh, so K just uses raw centroids * scale
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iso4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_iso4_0 * K_iso = (const block_iso4_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+    constexpr int n_blocks = D / QK_ISO4_0;
+    constexpr int qi_per_block = QK_ISO4_0 / (int)sizeof(int);
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        // Unpack 4-bit indices → centroid lookup (no inverse rotation, Q was pre-rotated)
+        float cent[QK_ISO4_0];
+        for (int j = 0; j < QK_ISO4_0 / 2; j++) {
+            uint8_t packed = K_iso[blk].qs[j];
+            cent[2*j]     = ISO4_0_CENTROIDS_FA[packed & 0xF];
+            cent[2*j + 1] = ISO4_0_CENTROIDS_FA[packed >> 4];
+        }
+
+        const float k_scale = __half2float(K_iso[blk].d);
+
+#pragma unroll
+        for (int k_local_0 = 0; k_local_0 < qi_per_block; k_local_0 += nthreads) {
+            const int k_local = k_local_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            const int elem_start = k_local * 4;
+            const int q_reg_idx = (blk * qi_per_block + k_local_0) / nthreads;
+
+            const int u = Q_q8[q_reg_idx];
+            const int8_t * q8 = (const int8_t *)&u;
+            const float2 Q_ds = ((const float2 *) Q_ds_v)[q_reg_idx];
+
+            float block_sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                block_sum += cent[elem_start + j] * (float)q8[j];
+            }
+
+            sum += block_sum * Q_ds.x * k_scale;
+        }
+    }
+
+    return sum;
+}
+
+// Flash attention V dequantize for iso3_0
+// NOTE: Returns raw centroids * scale (no inverse rotation). Inverse quat rotation is
+// applied once to the final VKQ result in fattn-vec.cuh (same optimization as TQ's WHT).
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_iso3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_iso3_0 * x = (const block_iso3_0 *) vx;
+
+    const int64_t ib  = i0 / QK_ISO3_0;
+    const int     iqs = i0 % QK_ISO3_0;
+
+    const float d = __half2float(x[ib].d);
+
+    float cent[ne];
+    for (int l = 0; l < ne; l++) {
+        const int j = iqs + l;
+        const int byte_group = j / 8;
+        const int bit_offset = j % 8;
+        const uint8_t * qp = &x[ib].qs[byte_group * 3];
+        uint8_t idx;
+        switch (bit_offset) {
+            case 0: idx =  qp[0]       & 0x7; break;
+            case 1: idx = (qp[0] >> 3) & 0x7; break;
+            case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 0x7; break;
+            case 3: idx = (qp[1] >> 1) & 0x7; break;
+            case 4: idx = (qp[1] >> 4) & 0x7; break;
+            case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 0x7; break;
+            case 6: idx = (qp[2] >> 2) & 0x7; break;
+            default: idx = (qp[2] >> 5) & 0x7; break;
+        }
+        cent[l] = ISO3_0_CENTROIDS_FA[idx] * d;
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(cent[l0], cent[l0 + 1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = cent[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+// Flash attention V dequantize for iso4_0
+// NOTE: Returns raw centroids * scale (no inverse rotation). Inverse quat rotation is
+// applied once to the final VKQ result in fattn-vec.cuh.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_iso4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_iso4_0 * x = (const block_iso4_0 *) vx;
+
+    const int64_t ib  = i0 / QK_ISO4_0;
+    const int     iqs = i0 % QK_ISO4_0;
+
+    const float d = __half2float(x[ib].d);
+
+    float cent[ne];
+    for (int l = 0; l < ne; l++) {
+        const int j = iqs + l;
+        uint8_t packed = x[ib].qs[j / 2];
+        uint8_t idx = (j & 1) ? (packed >> 4) : (packed & 0xF);
+        cent[l] = ISO4_0_CENTROIDS_FA[idx] * d;
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(cent[l0], cent[l0 + 1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = cent[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -1013,6 +1288,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_tq3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TQ4_0) {
         return vec_dot_fattn_vec_KQ_tq4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_ISO3_0) {
+        return vec_dot_fattn_vec_KQ_iso3_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_ISO4_0) {
+        return vec_dot_fattn_vec_KQ_iso4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -1041,6 +1320,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_tq3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TQ4_0) {
         return dequantize_V_tq4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_ISO3_0) {
+        return dequantize_V_iso3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_ISO4_0) {
+        return dequantize_V_iso4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -1410,6 +1693,7 @@ void launch_fattn(
         half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            GGML_ASSERT(to_fp16 != nullptr && "FA dispatch selected a tensor-core kernel needing F16 K, but K's type has no to_fp16 CUDA conversion");
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
@@ -1418,6 +1702,7 @@ void launch_fattn(
         } else {
             GGML_ASSERT(K->nb[0] == ts);
             to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+            GGML_ASSERT(to_fp16 != nullptr && "FA dispatch selected a tensor-core kernel needing F16 K (non-contiguous), but K's type has no to_fp16_nc CUDA conversion");
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
@@ -1444,6 +1729,7 @@ void launch_fattn(
             half * V_f16 = (half *) f16_extra.V;
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                GGML_ASSERT(to_fp16 != nullptr && "FA dispatch selected a tensor-core kernel needing F16 V, but V's type has no to_fp16 CUDA conversion");
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16;
 
@@ -1453,6 +1739,7 @@ void launch_fattn(
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
                 to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                GGML_ASSERT(to_fp16 != nullptr && "FA dispatch selected a tensor-core kernel needing F16 V (non-contiguous), but V's type has no to_fp16_nc CUDA conversion");
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
