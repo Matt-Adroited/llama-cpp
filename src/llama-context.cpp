@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-triattention.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3911,6 +3913,73 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+// TriAttention C API
+
+int32_t llama_triattention_init(
+        struct llama_context * ctx,
+                  const char * stats_path,
+                     int32_t   budget,
+                     int32_t   divide_length,
+                     int32_t   offset_max,
+                     int32_t   mode,
+                     int32_t   trigger,
+                     int32_t   agg,
+                     int32_t   seed,
+                        bool   normalize_scores,
+                        bool   protect_prefill,
+                        bool   disable_mlr,
+                        bool   disable_trig,
+                        bool   enable_logging,
+                        bool   force) {
+    if (!ctx || !stats_path || stats_path[0] == '\0') {
+        return -1;
+    }
+
+    // Safety check: v2 scoring assumes standard full-RoPE K. MLA (DeepSeek-V2
+    // style latent KV) and KDA (Kimi Delta) reshape the K path in ways that
+    // would produce garbage scores. Skip unless --triattention-force.
+    const auto & hparams = ctx->get_model().hparams;
+    const bool is_mla = hparams.n_embd_head_k_mla_impl != 0 ||
+                       hparams.n_embd_head_v_mla_impl != 0;
+    const bool is_kda = hparams.n_embd_head_kda != 0;
+    if ((is_mla || is_kda) && !force) {
+        LLAMA_LOG_WARN(
+            "%s: %s model detected — TriAttention scoring is not validated for "
+            "this architecture. Skipping. Pass --triattention-force to override.\n",
+            __func__, is_mla ? "MLA" : "KDA");
+        return -1;
+    }
+
+    auto * mem = ctx->get_memory();
+    if (!mem) {
+        LLAMA_LOG_ERROR("%s: context has no memory\n", __func__);
+        return -1;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: memory is not a KV cache (recurrent models not supported)\n", __func__);
+        return -1;
+    }
+
+    triattention_config cfg = {};
+    cfg.budget           = (uint32_t)budget;
+    cfg.divide_length    = (uint32_t)divide_length;
+    cfg.offset_max       = (uint32_t)offset_max;
+    cfg.mode             = (triattention_mode)mode;
+    cfg.trigger          = (triattention_trigger)trigger;
+    cfg.agg              = (triattention_agg)agg;
+    cfg.seed             = seed;
+    cfg.normalize_scores = normalize_scores;
+    cfg.protect_prefill  = protect_prefill;
+    cfg.disable_mlr      = disable_mlr;
+    cfg.disable_trig     = disable_trig;
+    cfg.enable_logging   = enable_logging;
+
+    kv->init_triattention(stats_path, &cfg);
+    return kv->has_triattention() ? 0 : -1;
 }
 
 // llama state API

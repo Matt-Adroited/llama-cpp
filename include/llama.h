@@ -774,6 +774,26 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     //
+    // TriAttention KV cache eviction (arXiv 2604.04921)
+    //
+    LLAMA_API int32_t llama_triattention_init(
+            struct llama_context * ctx,
+                      const char * stats_path,
+                         int32_t   budget,
+                         int32_t   divide_length,
+                         int32_t   offset_max,
+                         int32_t   mode,
+                         int32_t   trigger,
+                         int32_t   agg,
+                         int32_t   seed,
+                            bool   normalize_scores,
+                            bool   protect_prefill,
+                            bool   disable_mlr,
+                            bool   disable_trig,
+                            bool   enable_logging,
+                            bool   force);
+
+    //
     // State / sessions
     //
 

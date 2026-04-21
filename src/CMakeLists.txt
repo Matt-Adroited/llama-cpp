@@ -35,6 +35,7 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
+            llama-triattention.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
