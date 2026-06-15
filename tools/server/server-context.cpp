@@ -516,6 +516,16 @@ struct server_slot {
                 "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
                 t_prompt_processing, n_prompt_tokens_processed, t_prompt, n_prompt_second);
 
+        {
+            const int32_t n_prompt_total = n_prompt_tokens_cache + n_prompt_tokens_processed;
+            const float   cache_hit_pct  = n_prompt_total > 0
+                ? 100.0f * (float) n_prompt_tokens_cache / (float) n_prompt_total
+                : 0.0f;
+            SLT_INF(*this,
+                    "    prompt cache = %10d / %5d tokens cached (%.1f%% hit)\n",
+                    n_prompt_tokens_cache, n_prompt_total, cache_hit_pct);
+        }
+
         SLT_INF(*this,
                 "       eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
                 t_token_generation, n_decoded, t_gen, n_gen_second);

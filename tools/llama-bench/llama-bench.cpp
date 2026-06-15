@@ -505,6 +505,12 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "tq4_0") {
         return GGML_TYPE_TQ4_0;
     }
+    if (s == "iso3_0") {
+        return GGML_TYPE_ISO3_0;
+    }
+    if (s == "iso4_0") {
+        return GGML_TYPE_ISO4_0;
+    }
 
     return GGML_TYPE_COUNT;
 }

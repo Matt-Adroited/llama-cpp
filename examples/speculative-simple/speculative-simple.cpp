@@ -58,6 +58,8 @@ int main(int argc, char ** argv) {
         params_dft.devices      = params_spec.devices;
         params_dft.model        = params_spec.mparams;
         params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+        params_dft.cache_type_k = params_spec.cache_type_k;
+        params_dft.cache_type_v = params_spec.cache_type_v;
 
         if (params_spec.cpuparams.n_threads > 0) {
             params_dft.cpuparams.n_threads       = params.speculative.draft.cpuparams.n_threads;
