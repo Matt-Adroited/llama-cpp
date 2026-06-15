@@ -2095,6 +2095,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"-cts", "--cache-type-s"}, "TYPE",
+        string_format(
+            "recurrent state data type (for KDA/SSM models)\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_s)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_s = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
     // TriAttention KV cache eviction args (arXiv 2604.04921)
     add_opt(common_arg(
         {"--triattention-stats"}, "PATH",

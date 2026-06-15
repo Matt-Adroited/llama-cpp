@@ -569,6 +569,7 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_s = GGML_TYPE_F32; // recurrent state data type (SSM/KDA) [EXPERIMENTAL]
 
     // TriAttention KV cache eviction (arXiv 2604.04921)
     std::string triattention_stats         = "";    // path to .triattention calibration file (empty = disabled)
